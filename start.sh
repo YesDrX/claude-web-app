@@ -51,5 +51,6 @@ echo "[*] Press Ctrl+C to stop"
 echo ""
 
 export CLAUDE_CODE_WEB_PORT="$Port"
+export MAX_THINKING_TOKENS=16000
 cd "$projectDir"
 uvicorn main:app --host "$HostAddr" --port "$Port" --log-level info

@@ -147,11 +147,12 @@ class AcpProcess:
 # ─── AcpSession ──────────────────────────────────────────────
 
 class AcpSession:
-    def __init__(self, db_id, working_dir="", env_vars="", idle_timeout=1800):
+    def __init__(self, db_id, working_dir="", env_vars="", idle_timeout=1800, effort="max"):
         self.db_id = db_id
         self.working_dir = working_dir
         self.env_vars = env_vars
         self.idle_timeout = idle_timeout
+        self._effort = effort
         self._proc: AcpProcess | None = None
         self._sid: str | None = None  # ACP session id
         self._claude_sid: str | None = None  # Claude resume id
@@ -193,15 +194,18 @@ class AcpSession:
         if resume and self._claude_sid:
             try:
                 r = await self._proc.request("session/load",
-                    {"sessionId": self._claude_sid, "cwd": cwd, "mcpServers": []}, timeout=30)
+                    {"sessionId": self._claude_sid, "cwd": cwd, "mcpServers": [],
+                     "_meta": {"claudeCode": {"options": {"effort": self._effort}}}}, timeout=30)
                 path_taken = f"session/load (resume {self._claude_sid[:8]}...)"
             except Exception as e:
                 load_error = str(e)
                 resume = False
         if not resume:
-            params = {"cwd": cwd, "mcpServers": []}
+            sdk_options = {"effort": self._effort}
             if self._claude_sid:
-                params["_meta"] = {"claudeCode": {"options": {"resume": self._claude_sid}}}
+                sdk_options["resume"] = self._claude_sid
+            params = {"cwd": cwd, "mcpServers": [],
+                      "_meta": {"claudeCode": {"options": sdk_options}}}
             r = await self._proc.request("session/new", params, timeout=30)
             if load_error:
                 path_taken = (f"session/load failed: {load_error} -> "
@@ -270,6 +274,9 @@ class AcpSession:
             try: await self._proc.request("session/set_model", {"sessionId": self._sid, "modelId": m}, timeout=10)
             except Exception: pass
 
+    def set_effort(self, eff):
+        self._effort = eff
+
     def get_modes(self): return list(self._modes)
 
     # ─── Notification → bus ──────────────────────────────────
@@ -318,6 +325,7 @@ class AcpManager:
     def __init__(self, idle_timeout=1800):
         self._sessions: dict[int, AcpSession] = {}
         self._buses: dict[int, SessionEventBus] = {}
+        self._efforts: dict[int, str] = {}
         self.idle_timeout = idle_timeout
 
     def get_event_bus(self, db_id): return self._buses.get(db_id)
@@ -327,10 +335,13 @@ class AcpManager:
 
     async def send_prompt(self, db_id, prompt, working_dir="", env_vars="", claude_sid=None) -> SessionEventBus:
         s = self._sessions.get(db_id)
+        effort = self._efforts.get(db_id, "max")
         if not s or not s.running or s.session_id is None:
-            s = AcpSession(db_id, working_dir, env_vars, self.idle_timeout)
+            s = AcpSession(db_id, working_dir, env_vars, self.idle_timeout, effort=effort)
             if claude_sid: s.set_claude_session_id(claude_sid)
             self._sessions[db_id] = s
+        else:
+            s.set_effort(effort)
         if not s.running:
             await s.connect(resume=bool(claude_sid))
         bus = await s.send_prompt(prompt)
@@ -353,5 +364,13 @@ class AcpManager:
     async def set_model(self, db_id, model):
         s = self._sessions.get(db_id)
         if s: await s.set_model(model)
+
+    def get_effort(self, db_id) -> str:
+        return self._efforts.get(db_id, "max")
+
+    def set_effort(self, db_id, eff):
+        self._efforts[db_id] = eff
+        s = self._sessions.get(db_id)
+        if s: s.set_effort(eff)
 
     def get_session(self, db_id): return self._sessions.get(db_id)

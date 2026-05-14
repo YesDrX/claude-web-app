@@ -37,6 +37,10 @@ MODEL_UPDATE    = "model_update"     # available models changed
 SET_MODE        = "set_mode"         # client → server: change session mode
 SET_MODEL       = "set_model"        # client → server: change model
 
+# ─── Effort ────────────────────────────────────────────────────
+EFFORT_UPDATE   = "effort_update"    # server → client: effort changed (cross-tab sync)
+SET_EFFORT      = "set_effort"       # client → server: change session effort
+
 # ─── Client → Server actions ──────────────────────────────────
 PROMPT          = "prompt"           # send a new prompt
 INTERRUPT       = "interrupt"        # cancel current generation (process stays alive)
@@ -45,8 +49,8 @@ PING            = "ping"             # client keepalive
 
 
 # ─── Convenience sets ─────────────────────────────────────────
-CLIENT_ACTIONS = {PROMPT, INTERRUPT, STOP, PING, SET_MODE, SET_MODEL, CONFIRM_PERMISSION}
+CLIENT_ACTIONS = {PROMPT, INTERRUPT, STOP, PING, SET_MODE, SET_MODEL, SET_EFFORT, CONFIRM_PERMISSION}
 STREAM_EVENTS = {ASSISTANT_TEXT, THINKING_TEXT, TOOL_USE, TOOL_RESULT,
                  ASK_USER_QUESTION, DONE, ERROR, INTERRUPTED, STDERR,
                  HEARTBEAT, STATUS, USER_MSG, SYSTEM_INIT,
-                 PERMISSION_REQUEST, MODE_UPDATE, MODEL_UPDATE}
+                 PERMISSION_REQUEST, MODE_UPDATE, MODEL_UPDATE, EFFORT_UPDATE}

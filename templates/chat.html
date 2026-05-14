@@ -11,6 +11,7 @@ const EVT = {
     SYSTEM_INIT: "system_init", PERMISSION_REQUEST: "permission_request",
     CONFIRM_PERMISSION: "confirm_permission", MODE_UPDATE: "mode_update",
     MODEL_UPDATE: "model_update", SET_MODE: "set_mode", SET_MODEL: "set_model",
+    EFFORT_UPDATE: "effort_update", SET_EFFORT: "set_effort",
     PROMPT: "prompt", INTERRUPT: "interrupt", STOP: "stop", PING: "ping"
 };
 
@@ -271,6 +272,10 @@ function handleEvent(evt) {
             const modeSel = document.getElementById('mode-select');
             if (modeSel) modeSel.value = currentMode;
             break;
+        case EVT.EFFORT_UPDATE:
+            const effortSel = document.getElementById('effort-select');
+            if (effortSel) effortSel.value = evt.effort;
+            break;
     }
 }
 
@@ -444,6 +449,14 @@ function changeMode(modeId) {
     }).catch(e => console.error('Failed to save mode:', e));
 }
 
+// ─── Effort selector ──────────────────────────────────────────
+
+function changeEffort(level) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({type: EVT.SET_EFFORT, effort: level}));
+    }
+}
+
 // ─── Settings ─────────────────────────────────────────────────
 
 function toggleSettings() {
@@ -602,6 +615,13 @@ document.addEventListener('DOMContentLoaded', () => {
     <select id="mode-select" onchange="changeMode(this.value)" class="bg-slate-700 border-slate-600 text-slate-200 rounded px-1.5 py-0.5 text-[10px] outline-none" title="Permission mode">
         {% for m in acp_modes %}
         <option value="{{ m }}" {% if session.mode == m %}selected{% endif %}>{{ m }}</option>
+        {% endfor %}
+    </select>
+
+    <!-- Effort dropdown (live, in-memory only) -->
+    <select id="effort-select" onchange="changeEffort(this.value)" class="bg-slate-700 border-slate-600 text-slate-200 rounded px-1.5 py-0.5 text-[10px] outline-none" title="Effort level">
+        {% for e in effort_levels %}
+        <option value="{{ e }}" {% if e == current_effort %}selected{% endif %}>{{ e }}</option>
         {% endfor %}
     </select>
 

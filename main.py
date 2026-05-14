@@ -28,6 +28,7 @@ from events import (
     ASK_USER_QUESTION, DONE, INTERRUPTED, ERROR, STDERR,
     SYSTEM_INIT, PERMISSION_REQUEST, CONFIRM_PERMISSION,
     MODE_UPDATE, MODEL_UPDATE, SET_MODE, SET_MODEL,
+    EFFORT_UPDATE, SET_EFFORT,
     PROMPT, INTERRUPT, STOP, PING,
     CLIENT_ACTIONS, STREAM_EVENTS,
 )
@@ -468,6 +469,8 @@ async def chat_page(request: Request, sid: int):
         "default_model": default_model,
         "models": available_models,
         "acp_modes": ["default", "acceptEdits", "bypassPermissions", "plan"],
+        "effort_levels": ["low", "medium", "high", "xhigh", "max"],
+        "current_effort": acp_manager.get_effort(sid),
     })
 
 
@@ -744,6 +747,11 @@ async def _handle_control(ws, sid, data, bus):
             bus.publish({"type": MODE_UPDATE, "mode": data.get("mode", "")}, transient=True)
     elif t == SET_MODEL:
         await acp_manager.set_model(sid, data.get("model", ""))
+    elif t == SET_EFFORT:
+        eff = data.get("effort", "max") or "max"
+        acp_manager.set_effort(sid, eff)
+        if bus:
+            bus.publish({"type": EFFORT_UPDATE, "effort": eff}, transient=True)
     elif t == PING:
         await _ws_send(ws, sid, {"type": PONG})
     return False
