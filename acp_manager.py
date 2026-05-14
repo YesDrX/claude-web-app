@@ -1,0 +1,357 @@
+"""ACP subprocess manager. Spawns node ./node_modules/@agentclientprotocol/
+claude-agent-acp/dist/index.js, speaks JSON-RPC 2.0 over stdio NDJSON.
+
+One AcpSession per DB session. Idle timeout → close. Next prompt respawns + load."""
+import asyncio, json, os, queue, subprocess, threading, time
+from pathlib import Path
+from claude_manager import SessionEventBus
+
+ACP_MODES = ["default", "acceptEdits", "bypassPermissions", "plan"]
+
+# ─── Normalize ACP update → frontend event ───────────────────
+
+def _acp_to_event(update: dict) -> list[dict]:
+    su = update.get("sessionUpdate", "")
+    if su == "agent_message_chunk":
+        c = update.get("content", {})
+        return [{"type": "assistant_text", "text": c.get("text", "")}] if c.get("type") == "text" else []
+    if su == "agent_thought_chunk":
+        return [{"type": "thinking_text", "text": update.get("content", {}).get("text", "")}]
+    if su == "tool_call":
+        title = update.get("title", "unknown")
+        inp = update.get("rawInput", {})
+        if title.lower().replace("_", "") == "askuserquestion":
+            return [{"type": "ask_user_question", "question": inp.get("question", ""), "input": inp}]
+        return [{"type": "tool_use", "name": title, "input": inp}]
+    if su == "tool_call_update":
+        if update.get("status") != "completed":
+            return []
+        parts = []
+        for item in update.get("content", []):
+            if isinstance(item, dict):
+                inner = item.get("content", {})
+                if isinstance(inner, dict):
+                    parts.append(inner.get("text", ""))
+                elif isinstance(inner, str):
+                    parts.append(inner)
+        return [{"type": "tool_result", "data": "".join(parts)[:2000]}]
+    return []
+
+
+# ─── AcpProcess: subprocess + JSON-RPC ───────────────────────
+
+class AcpProcess:
+    def __init__(self, working_dir=None, env_vars=""):
+        self.working_dir = working_dir
+        self._p: subprocess.Popen | None = None
+        self._stopped = False
+        self._rid = 0
+        self._pending: dict[int, asyncio.Future] = {}
+        self._on_msg: callable | None = None
+        self._on_exit: callable | None = None
+        self._extra_env = {}
+        if env_vars:
+            for line in env_vars.strip().split("\n"):
+                if "=" in line and not line.startswith("#"):
+                    k, _, v = line.partition("=")
+                    self._extra_env[k.strip()] = v.strip().strip('"').strip("'")
+
+    @property
+    def running(self): return self._p is not None and self._p.poll() is None
+
+    def start(self):
+        script = Path(__file__).parent / "node_modules" / "@agentclientprotocol" / "claude-agent-acp" / "dist" / "index.js"
+        env = os.environ.copy()
+        env.update(self._extra_env)
+        claude_dir = os.path.expandvars(r"%USERPROFILE%\.local\bin")
+        if os.path.isdir(claude_dir):
+            env["PATH"] = claude_dir + (";" if os.name == "nt" else ":") + env.get("PATH", "")
+        cwd = self.working_dir or os.getcwd()
+        self._p = subprocess.Popen(["node", str(script)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, cwd=cwd, env=env)
+        threading.Thread(target=self._read, daemon=True).start()
+        threading.Thread(target=self._read_err, daemon=True).start()
+
+    def set_on_message(self, cb): self._on_msg = cb
+    def set_on_exit(self, cb): self._on_exit = cb
+
+    def _read(self):
+        try:
+            for line in iter(self._p.stdout.readline, b''):
+                if self._stopped: break
+                try:
+                    msg = json.loads(line.decode("utf-8", errors="replace").strip())
+                except json.JSONDecodeError:
+                    continue
+                if "id" in msg and isinstance(msg["id"], int):
+                    fut = self._pending.pop(msg["id"], None)
+                    if fut and not fut.done():
+                        if "result" in msg:
+                            fut.get_loop().call_soon_threadsafe(fut.set_result, msg["result"])
+                        elif "error" in msg:
+                            fut.get_loop().call_soon_threadsafe(fut.set_exception,
+                                RuntimeError(msg["error"].get("message", "ACP error")))
+                elif "method" in msg and self._on_msg:
+                    self._on_msg(msg)
+        except Exception as e:
+            print(f"[AcpProcess] read error: {e}")
+        finally:
+            if self._on_exit: self._on_exit()
+
+    def _read_err(self):
+        try:
+            for line in iter(self._p.stderr.readline, b''):
+                if self._stopped: break
+                t = line.decode("utf-8", errors="replace").rstrip()
+                if t: print(f"[AcpProcess:stderr] {t}")
+        except Exception: pass
+
+    async def request(self, method, params=None, timeout=300):
+        if not self.running: raise RuntimeError("ACP not running")
+        self._rid += 1
+        rid = self._rid
+        msg = {"jsonrpc": "2.0", "id": rid, "method": method}
+        if params: msg["params"] = params
+        fut = asyncio.get_event_loop().create_future()
+        self._pending[rid] = fut
+        self._send(msg)
+        return await asyncio.wait_for(fut, timeout=timeout)
+
+    def notify(self, method, params=None):
+        msg = {"jsonrpc": "2.0", "method": method}
+        if params: msg["params"] = params
+        self._send(msg)
+
+    def _send(self, msg):
+        if self._p and self._p.stdin:
+            try:
+                self._p.stdin.write((json.dumps(msg) + "\n").encode())
+                self._p.stdin.flush()
+            except Exception: pass
+
+    def stop(self):
+        self._stopped = True
+        if self._p and self._p.poll() is None:
+            try:
+                self._p.terminate()
+                self._p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self._p.kill()
+            except Exception: pass
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.get_loop().call_soon_threadsafe(fut.set_exception, RuntimeError("ACP stopped"))
+        self._pending.clear()
+
+
+# ─── AcpSession ──────────────────────────────────────────────
+
+class AcpSession:
+    def __init__(self, db_id, working_dir="", env_vars="", idle_timeout=1800):
+        self.db_id = db_id
+        self.working_dir = working_dir
+        self.env_vars = env_vars
+        self.idle_timeout = idle_timeout
+        self._proc: AcpProcess | None = None
+        self._sid: str | None = None  # ACP session id
+        self._claude_sid: str | None = None  # Claude resume id
+        self._bus: SessionEventBus | None = None
+        self._mode = "bypassPermissions"
+        self._model = ""
+        self._idle_task: asyncio.Task | None = None
+        self._modes = list(ACP_MODES)
+        self._on_event: callable | None = None  # called for each event (DB persistence)
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    @property
+    def running(self): return self._proc is not None and self._proc.running
+    @property
+    def session_id(self): return self._sid
+    @property
+    def claude_session_id(self): return self._claude_sid
+    def set_claude_session_id(self, s): self._claude_sid = s
+
+    async def connect(self, resume=False):
+        if self.running:
+            return
+        self._loop = asyncio.get_event_loop()
+        self._proc = AcpProcess(self.working_dir, self.env_vars)
+        self._proc.set_on_message(self._on_notification)
+        self._proc.set_on_exit(self._on_exit)
+        self._proc.start()
+        await self._proc.request("initialize", {"protocolVersion": 1,
+            "clientCapabilities": {"fs": {"readTextFile": True, "writeTextFile": True}}}, timeout=60)
+        cwd = self.working_dir or os.getcwd()
+        # Resolve symlinks so the cwd key matches what ACP stores in its jslog paths.
+        try:
+            cwd = os.path.realpath(cwd)
+        except Exception:
+            pass
+        prior_sid = self._claude_sid
+        path_taken = "session/new (fresh)"
+        load_error = None
+        if resume and self._claude_sid:
+            try:
+                r = await self._proc.request("session/load",
+                    {"sessionId": self._claude_sid, "cwd": cwd, "mcpServers": []}, timeout=30)
+                path_taken = f"session/load (resume {self._claude_sid[:8]}...)"
+            except Exception as e:
+                load_error = str(e)
+                resume = False
+        if not resume:
+            params = {"cwd": cwd, "mcpServers": []}
+            if self._claude_sid:
+                params["_meta"] = {"claudeCode": {"options": {"resume": self._claude_sid}}}
+            r = await self._proc.request("session/new", params, timeout=30)
+            if load_error:
+                path_taken = (f"session/load failed: {load_error} -> "
+                              f"session/new (_meta.resume {self._claude_sid[:8] if self._claude_sid else '?'}...)")
+            elif self._claude_sid:
+                path_taken = f"session/new (_meta.resume {self._claude_sid[:8]}...)"
+        new_sid = r.get("sessionId") or self._claude_sid
+        self._sid = new_sid
+        self._claude_sid = new_sid
+        # Log the result so silent resume failures don't go unnoticed.
+        if prior_sid and new_sid and prior_sid != new_sid:
+            print(f"[AcpSession {self.db_id}] connect: {path_taken} -> "
+                  f"sessionId changed {prior_sid[:8]}... -> {new_sid[:8]}... "
+                  f"(context may not be carried)")
+        else:
+            sid_display = new_sid[:8] if new_sid else "?"
+            print(f"[AcpSession {self.db_id}] connect: {path_taken} -> sessionId={sid_display}")
+        await self.set_mode(self._mode)
+        self._reset_idle()
+
+    async def disconnect(self):
+        self._cancel_idle()
+        sid = self._sid
+        self._sid = None          # clear BEFORE await so send_prompt sees it's gone
+        if self._proc and self._proc.running and sid:
+            try: await self._proc.request("session/close", {"sessionId": sid}, timeout=5)
+            except Exception: pass
+        if self._proc: self._proc.stop(); self._proc = None
+
+    async def send_prompt(self, text) -> SessionEventBus:
+        if self._bus is None:
+            self._bus = SessionEventBus()
+        bus = self._bus
+        bus._running = True
+        bus._loop = self._loop
+        self._cancel_idle()
+        bus._task = asyncio.create_task(self._run(bus, text))
+        return bus
+
+    async def _run(self, bus, text):
+        try:
+            r = await self._proc.request("session/prompt",
+                {"sessionId": self._sid, "prompt": [{"type": "text", "text": text}]}, timeout=600)
+            bus.publish({"type": "done", "summary": "Completed." if r.get("stopReason") == "end_turn"
+                else f"Stopped: {r.get('stopReason', '')}", "has_denials": False,
+                "data": {"stop_reason": r.get("stopReason"), "usage": r.get("usage", {})}})
+        except Exception as e:
+            bus.publish({"type": "error", "text": str(e)})
+        finally:
+            bus._running = False
+            self._reset_idle()
+
+    async def interrupt(self):
+        if self._proc and self._proc.running and self._sid:
+            self._proc.notify("session/cancel", {"sessionId": self._sid})
+
+    async def set_mode(self, m):
+        self._mode = m
+        if self._proc and self._proc.running and self._sid:
+            try: await self._proc.request("session/set_mode", {"sessionId": self._sid, "modeId": m}, timeout=10)
+            except Exception: pass
+
+    async def set_model(self, m):
+        self._model = m
+        if self._proc and self._proc.running and self._sid:
+            try: await self._proc.request("session/set_model", {"sessionId": self._sid, "modelId": m}, timeout=10)
+            except Exception: pass
+
+    def get_modes(self): return list(self._modes)
+
+    # ─── Notification → bus ──────────────────────────────────
+
+    def _on_notification(self, msg):
+        method = msg.get("method", "")
+        if method != "session/update": return
+        update = msg.get("params", {}).get("update", {})
+        su = update.get("sessionUpdate", "")
+        if su == "system_init":
+            sid = update.get("session_id") or update.get("sessionId") or ""
+            if sid: self._claude_sid = sid
+            if self._bus: self._bus.publish({"type": "system_init", "session_id": sid})
+            return
+        if su == "config_option_update":
+            for opt in update.get("configOptions", []):
+                if opt.get("category") == "mode":
+                    self._modes = [m.get("value", m) if isinstance(m, dict) else m for m in opt.get("options", [])]
+            return
+        for evt in _acp_to_event(update):
+            if self._bus: self._bus.publish(evt)
+
+    def _on_exit(self):
+        if self._bus and self._bus.running:
+            self._bus.publish({"type": "error", "text": "ACP process exited"})
+            self._bus._running = False
+
+    def _reset_idle(self):
+        self._cancel_idle()
+        self._idle_task = asyncio.create_task(self._idle())
+
+    def _cancel_idle(self):
+        if self._idle_task: self._idle_task.cancel(); self._idle_task = None
+
+    async def _idle(self):
+        try:
+            await asyncio.sleep(self.idle_timeout)
+            print(f"[AcpSession {self.db_id}] idle timeout fired ({self.idle_timeout}s) - tearing down subprocess")
+            await self.disconnect()
+        except asyncio.CancelledError: pass
+
+
+# ─── AcpManager: registry ────────────────────────────────────
+
+class AcpManager:
+    def __init__(self, idle_timeout=1800):
+        self._sessions: dict[int, AcpSession] = {}
+        self._buses: dict[int, SessionEventBus] = {}
+        self.idle_timeout = idle_timeout
+
+    def get_event_bus(self, db_id): return self._buses.get(db_id)
+    def cleanup_event_bus(self, db_id):
+        b = self._buses.pop(db_id, None)
+        if b: b._running = False
+
+    async def send_prompt(self, db_id, prompt, working_dir="", env_vars="", claude_sid=None) -> SessionEventBus:
+        s = self._sessions.get(db_id)
+        if not s or not s.running or s.session_id is None:
+            s = AcpSession(db_id, working_dir, env_vars, self.idle_timeout)
+            if claude_sid: s.set_claude_session_id(claude_sid)
+            self._sessions[db_id] = s
+        if not s.running:
+            await s.connect(resume=bool(claude_sid))
+        bus = await s.send_prompt(prompt)
+        self._buses[db_id] = bus
+        return bus
+
+    async def interrupt_session(self, db_id):
+        s = self._sessions.get(db_id)
+        if s: await s.interrupt(); self.cleanup_event_bus(db_id)
+
+    async def close_session(self, db_id):
+        s = self._sessions.pop(db_id, None)
+        if s: await s.disconnect()
+        self.cleanup_event_bus(db_id)
+
+    async def set_mode(self, db_id, mode):
+        s = self._sessions.get(db_id)
+        if s: await s.set_mode(mode)
+
+    async def set_model(self, db_id, model):
+        s = self._sessions.get(db_id)
+        if s: await s.set_model(model)
+
+    def get_session(self, db_id): return self._sessions.get(db_id)

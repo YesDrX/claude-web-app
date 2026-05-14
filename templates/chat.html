@@ -1,0 +1,734 @@
+{% extends "base.html" %}
+{% block title %}{{ session.title }} - Claude Code Web{% endblock %}
+{% block head_extra %}
+<script>
+// ─── Event type constants (synced with events.py) ─────────────
+const EVT = {
+    REPLAY_START: "replay_start", HEARTBEAT: "heartbeat", STATUS: "status", PONG: "pong",
+    USER_MSG: "user_msg", ASSISTANT_TEXT: "assistant_text", THINKING_TEXT: "thinking_text",
+    TOOL_USE: "tool_use", TOOL_RESULT: "tool_result", ASK_USER_QUESTION: "ask_user_question",
+    DONE: "done", INTERRUPTED: "interrupted", ERROR: "error", STDERR: "stderr",
+    SYSTEM_INIT: "system_init", PERMISSION_REQUEST: "permission_request",
+    CONFIRM_PERMISSION: "confirm_permission", MODE_UPDATE: "mode_update",
+    MODEL_UPDATE: "model_update", SET_MODE: "set_mode", SET_MODEL: "set_model",
+    PROMPT: "prompt", INTERRUPT: "interrupt", STOP: "stop", PING: "ping"
+};
+
+let ws = null;
+let currentAssistantDiv = null;
+let currentReasoningContent = null;
+let currentReasoningToggle = null;
+let currentToolDiv = null;
+let currentToolContainer = null;
+let toolCallCount = 0;
+let inputDisabled = false;
+let currentRawText = '';
+let reconnectAttempts = 0;
+let reconnectTimer = null;
+let intentionalClose = false;
+let inReplay = false;
+let currentPhase = 'IDLE';
+let currentSubPhase = null;
+let thinkingText = '';
+let thinkingExpanded = false;
+let pendingQuestion = false;
+let todoItems = [];
+let currentToolName = '';
+let currentToolArgs = '';
+let stdoutTailText = '';
+let lastEventTime = Date.now();
+let spinnerCheckInterval = null;
+let promptStartTime = Date.now();
+let lastProcessedSeq = 0;
+let currentMode = '{{ session.mode or "bypassPermissions" }}';
+
+function renderMarkdown(text) {
+    if (!text) return '';
+    const decoded = text.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+    const escaped = decoded.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return marked.parse(escaped, { breaks: true, gfm: true });
+}
+
+function connect() {
+    if (ws && ws.readyState !== WebSocket.CLOSED) {
+        intentionalClose = true; ws.close(1000, 'Reconnecting'); intentionalClose = false;
+    }
+    const fromSeq = lastProcessedSeq > 0 ? lastProcessedSeq + 1 : 0;
+    const url = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws/{{ session.id }}?from_seq=' + fromSeq;
+    ws = new WebSocket(url);
+    ws.onopen = () => {
+        reconnectAttempts = 0;
+        document.getElementById('status-indicator').innerHTML = '<span class="text-green-400 text-xs"><i class="fa-solid fa-circle text-[6px] mr-1"></i> Connected</span>';
+        document.getElementById('reconnect-banner').classList.add('hidden');
+        inputDisabled = false;
+        document.getElementById('prompt-input').disabled = false;
+        updateSubmitState();
+    };
+    ws.onmessage = (e) => { const data = JSON.parse(e.data); console.log('[WS] raw:', JSON.stringify(data).substring(0, 200)); handleEvent(data); };
+    ws.onclose = (evt) => {
+        document.getElementById('status-indicator').innerHTML = '<span class="text-red-400 text-xs"><i class="fa-solid fa-circle text-[6px] mr-1"></i> Disconnected</span>';
+        if (!intentionalClose) scheduleReconnect();
+    };
+    ws.onerror = () => {
+        document.getElementById('status-indicator').innerHTML = '<span class="text-yellow-400 text-xs"><i class="fa-solid fa-triangle-exclamation mr-1"></i> Error</span>';
+    };
+}
+
+function scheduleReconnect() {
+    if (reconnectTimer) return;
+    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+    reconnectAttempts++;
+    document.getElementById('reconnect-banner').classList.remove('hidden');
+    document.getElementById('reconnect-countdown').textContent = Math.round(delay / 1000);
+    reconnectTimer = setTimeout(() => { reconnectTimer = null; connect(); }, delay);
+}
+
+function manualReconnect() {
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    reconnectAttempts = 0; connect();
+}
+
+let statusToastTimer = null;
+function setStatus(iconClass, colorClass, text) {
+    const toast = document.getElementById('status-toast');
+    const span = document.getElementById('status-toast-text');
+    span.innerHTML = '<span class="' + colorClass + ' font-semibold"><i class="' + iconClass + ' mr-1.5"></i>' + escapeHtml(text) + '</span>';
+    toast.classList.add('opacity-100'); toast.classList.remove('opacity-0', 'pointer-events-none');
+    if (statusToastTimer) clearTimeout(statusToastTimer);
+    statusToastTimer = setTimeout(hideStatusToast, 7500);
+}
+function hideStatusToast() {
+    const toast = document.getElementById('status-toast');
+    toast.classList.add('opacity-0', 'pointer-events-none'); toast.classList.remove('opacity-100');
+    if (statusToastTimer) { clearTimeout(statusToastTimer); statusToastTimer = null; }
+}
+
+function handleEvent(evt) {
+    if (evt.seq != null) { lastProcessedSeq = Math.max(lastProcessedSeq, evt.seq); }
+    console.log('[WS] recv', evt.type, 'seq=' + (evt.seq != null ? evt.seq : '-'), inReplay ? '(replay)' : '(live)',
+        evt.text ? 'text=' + JSON.stringify(evt.text.substring(0, 60)) :
+        evt.name ? 'name=' + evt.name :
+        evt.summary ? 'summary=' + evt.summary :
+        evt.count != null ? 'count=' + evt.count :
+        '');
+    const container = document.getElementById('messages-container');
+    switch (evt.type) {
+        case EVT.REPLAY_START:
+            inReplay = true; lastProcessedSeq = 0; removeActivityBar();
+            // Never wipe DOM — Jinja already rendered the full DB history.
+            // Only reset in-progress streaming state.
+            currentAssistantDiv = null; currentReasoningContent = null; currentReasoningToggle = null;
+            currentToolDiv = null; currentToolContainer = null; toolCallCount = 0;
+            currentRawText = ''; thinkingText = ''; todoItems = []; pendingQuestion = false;
+            inputDisabled = true;
+            document.getElementById('prompt-input').disabled = true;
+            document.getElementById('send-btn').disabled = true;
+            setStatus('fa-solid fa-spinner fa-spin', 'text-blue-400', 'Resuming session...');
+            return;
+        case EVT.USER_MSG:
+            removeActivityBar(); finalizeCurrentReasoning();
+            currentAssistantDiv = null; currentReasoningContent = null; currentReasoningToggle = null;
+            thinkingText = ''; todoItems = []; pendingQuestion = false;
+            currentToolDiv = null; currentToolContainer = null; toolCallCount = 0; currentRawText = '';
+            const userDiv = document.createElement('div');
+            userDiv.className = 'flex gap-3 mb-4 pb-4 border-b border-slate-700/30 justify-end';
+            userDiv.innerHTML = `<div class="flex-1 max-w-[80%]"><p class="text-xs text-right text-slate-400 mb-1">You</p><div class="bg-blue-700/30 rounded-lg p-3 text-sm markdown-content">${renderMarkdown(evt.text)}</div></div><div class="w-8 h-8 rounded-full bg-slate-600 flex items-center justify-center flex-shrink-0"><i class="fa-solid fa-user text-xs"></i></div>`;
+            container.appendChild(userDiv); container.scrollTop = container.scrollHeight;
+            break;
+        case EVT.STATUS:
+            setStatus('fa-solid fa-spinner fa-spin', 'text-yellow-400', escapeHtml(evt.text));
+            ensureActivityBar(); currentPhase = 'ACTIVE'; noteEventReceived(); updateElapsed();
+            break;
+        case EVT.THINKING_TEXT:
+            ensureActivityBar(); currentPhase = 'ACTIVE'; currentSubPhase = 'thinking';
+            noteEventReceived(); updatePhaseLabel('Thinking...'); updateElapsed();
+            appendReasoningText(evt.text);
+            break;
+        case EVT.HEARTBEAT:
+            if (currentPhase === 'ACTIVE') updateElapsed();
+            break;
+        case EVT.ASSISTANT_TEXT:
+            setStatus('fa-solid fa-spinner fa-spin', 'text-blue-400', 'Generating...');
+            ensureActivityBar(); currentPhase = 'ACTIVE'; currentSubPhase = 'generating';
+            noteEventReceived(); updatePhaseLabel('Generating...'); updateElapsed();
+            ensureAssistantDiv(); currentRawText += evt.text;
+            const contentDiv = currentAssistantDiv.querySelector('.assistant-content');
+            if (contentDiv) { contentDiv.classList.remove('hidden'); contentDiv.innerHTML = renderMarkdown(currentRawText); }
+            container.scrollTop = container.scrollHeight;
+            break;
+        case EVT.TOOL_USE:
+            setStatus('fa-solid fa-spinner fa-spin', 'text-purple-400', 'Running ' + escapeHtml(evt.name) + '...');
+            ensureActivityBar(); currentPhase = 'ACTIVE'; currentSubPhase = 'running_tool';
+            noteEventReceived(); updatePhaseLabel('Running ' + escapeHtml(evt.name) + '...'); updateElapsed();
+            updateCurrentTool(evt.name, evt.input);
+            if (evt.name === 'TodoWrite' && evt.input && evt.input.todos) updateTodos(evt.input.todos);
+            ensureAssistantDiv();
+            if (!currentToolContainer) {
+                currentToolContainer = currentAssistantDiv.querySelector('.tool-calls-container');
+                if (currentToolContainer) { currentToolContainer.classList.remove('hidden'); currentToolContainer.innerHTML = ''; }
+            }
+            toolCallCount++;
+            const toolInput = JSON.stringify(evt.input, null, 2).substring(0, 500);
+            const toolId = 'tool-' + Date.now() + '-' + Math.random().toString(36).substr(2, 4);
+            const toolItem = document.createElement('div');
+            toolItem.className = 'p-2 border-b border-slate-700 last:border-0 hover:bg-slate-800/50 transition-colors';
+            toolItem.innerHTML = `<div class="flex items-center gap-2 cursor-pointer" onclick="const d=this.nextElementSibling;d.classList.toggle('hidden');this.querySelector('i').classList.toggle('fa-chevron-right');this.querySelector('i').classList.toggle('fa-chevron-down');"><i class="fa-solid fa-chevron-right text-[10px] text-slate-400"></i><span class="text-xs text-purple-400 font-medium">${escapeHtml(evt.name)}</span><span class="text-[10px] text-slate-600 ml-auto">#${toolCallCount}</span></div><div id="${toolId}-body" class="hidden mt-1"><div class="bg-slate-900 rounded p-1.5 text-[10px] text-slate-300 font-mono overflow-x-auto"><pre class="whitespace-pre-wrap">${escapeHtml(toolInput)}</pre></div><div id="${toolId}-result"></div></div>`;
+            currentToolContainer.appendChild(toolItem);
+            currentToolContainer.scrollTop = currentToolContainer.scrollHeight;
+            container.scrollTop = container.scrollHeight;
+            currentToolDiv = { div: toolItem, id: toolId };
+            break;
+        case EVT.ASK_USER_QUESTION:
+            pendingQuestion = true; noteEventReceived();
+            currentSubPhase = 'asking_user'; updatePhaseLabel('Awaiting your input...'); updateElapsed();
+            ensureAssistantDiv();
+            const qContainer = currentAssistantDiv.querySelector('.tool-calls-container');
+            if (qContainer) {
+                const qItem = document.createElement('div');
+                qItem.className = 'flex items-start gap-2 p-2 rounded bg-blue-900/20';
+                qItem.innerHTML = `<i class="fa-solid fa-question-circle text-blue-400 mt-0.5 text-xs"></i><div class="text-xs markdown-content text-slate-200">${renderMarkdown(evt.question || evt.input?.question || 'Claude needs your input')}</div>`;
+                qContainer.appendChild(qItem); qContainer.classList.remove('hidden');
+            }
+            container.scrollTop = container.scrollHeight;
+            break;
+        case EVT.TOOL_RESULT:
+            setStatus('fa-solid fa-check', 'text-green-400', 'Tool completed');
+            noteEventReceived();
+            updateStdoutTail(typeof evt.data === 'string' ? evt.data : JSON.stringify(evt.data));
+            currentSubPhase = 'thinking'; updatePhaseLabel('Processing tool result...');
+            if (currentToolDiv) {
+                const raw = evt.data || '';
+                const resultText = typeof raw === 'string' ? raw : JSON.stringify(raw);
+                const truncated = resultText.length > 2000 ? resultText.substring(0, 2000) + '\n... (truncated)' : resultText;
+                const resultEl = document.getElementById(currentToolDiv.id + '-result');
+                if (resultEl) resultEl.innerHTML = '<div class="mt-1 bg-slate-800 rounded p-1.5 text-[10px] text-green-400/80 font-mono overflow-x-auto max-h-24 overflow-y-auto"><pre class="whitespace-pre-wrap">' + escapeHtml(truncated) + '</pre></div>';
+            }
+            currentToolDiv = null;
+            break;
+        case EVT.PERMISSION_REQUEST:
+            // Show tool approval dialog
+            noteEventReceived();
+            currentSubPhase = 'awaiting_permission';
+            updatePhaseLabel('Approval needed: ' + escapeHtml(evt.title || 'tool'));
+            updateElapsed();
+            showPermissionDialog(evt);
+            break;
+        case EVT.DONE:
+            stopSpinnerCheck(); currentPhase = 'IDLE';
+            finalizeCurrentReasoning(); hideActivityBar();
+            const summary = evt.summary || '';
+            const hasDenials = evt.has_denials || false;
+            if (hasDenials && !pendingQuestion) setStatus('fa-solid fa-hand', 'text-red-400', 'Approval needed');
+            else if (summary && !pendingQuestion) setStatus('fa-solid fa-check-circle', 'text-green-400', summary);
+            else setStatus('fa-solid fa-check-circle', 'text-green-400', 'Done');
+            if (currentAssistantDiv && summary && !pendingQuestion) {
+                const banner = document.createElement('div');
+                banner.className = hasDenials ? 'mt-2 px-3 py-2 rounded-lg text-xs bg-red-900/30 border border-red-700 text-red-300' : 'mt-2 px-3 py-2 rounded-lg text-xs bg-slate-800/70 border border-slate-600 text-slate-300';
+                banner.innerHTML = hasDenials ? '<i class="fa-solid fa-triangle-exclamation mr-1"></i>' + escapeHtml(summary) : '<i class="fa-solid fa-circle-check mr-1 text-green-400"></i>' + escapeHtml(summary);
+                (currentAssistantDiv.querySelector('.flex-1') || currentAssistantDiv).appendChild(banner);
+            }
+            currentAssistantDiv = null; currentReasoningContent = null; currentReasoningToggle = null;
+            currentToolDiv = null; currentToolContainer = null; toolCallCount = 0; currentRawText = '';
+            inputDisabled = false;
+            document.getElementById('prompt-input').disabled = false;
+            updateSubmitState();
+            if (evt.data && evt.data.usage) {
+                const u = evt.data.usage; const total = (u.input_tokens || 0) + (u.output_tokens || 0);
+                document.getElementById('token-count').textContent = total;
+                const topEl = document.getElementById('token-count-top'); if (topEl) topEl.textContent = total;
+            }
+            container.scrollTop = container.scrollHeight;
+            if (inReplay) inReplay = false;
+            break;
+        case EVT.ERROR:
+            removeActivityBar(); finalizeCurrentReasoning();
+            setStatus('fa-solid fa-circle-exclamation', 'text-red-400', escapeHtml(evt.text));
+            currentAssistantDiv = null; currentReasoningContent = null; currentReasoningToggle = null;
+            currentToolDiv = null; currentToolContainer = null; toolCallCount = 0; currentRawText = '';
+            thinkingText = ''; inputDisabled = false;
+            document.getElementById('prompt-input').disabled = false; updateSubmitState();
+            break;
+        case EVT.INTERRUPTED:
+            removeActivityBar(); finalizeCurrentReasoning();
+            setStatus('fa-solid fa-hand', 'text-orange-400', escapeHtml(evt.text || 'Interrupted'));
+            currentAssistantDiv = null; currentReasoningContent = null; currentReasoningToggle = null;
+            currentToolDiv = null; currentToolContainer = null; toolCallCount = 0; currentRawText = '';
+            thinkingText = ''; inputDisabled = false;
+            document.getElementById('prompt-input').disabled = false; updateSubmitState();
+            closePermissionDialog();
+            break;
+        case EVT.STDERR:
+            const errDiv = document.createElement('div');
+            errDiv.className = 'flex gap-3 mb-3 pb-3 border-b border-slate-700/30';
+            errDiv.innerHTML = `<div class="w-8 h-8 rounded-full bg-red-700 flex items-center justify-center flex-shrink-0"><i class="fa-solid fa-circle-exclamation text-xs"></i></div><div class="flex-1 min-w-0"><p class="text-xs text-red-400 mb-1">Stderr</p><pre class="text-xs text-red-300 whitespace-pre-wrap bg-slate-900 rounded p-2 overflow-x-auto">${escapeHtml(evt.text)}</pre></div>`;
+            container.appendChild(errDiv); container.scrollTop = container.scrollHeight;
+            break;
+        case EVT.SYSTEM_INIT:
+            if (evt.session_id) document.getElementById('claude-sid').textContent = evt.session_id;
+            break;
+        case EVT.MODE_UPDATE:
+            currentMode = evt.mode;
+            const modeSel = document.getElementById('mode-select');
+            if (modeSel) modeSel.value = currentMode;
+            break;
+    }
+}
+
+// ─── Permission dialog ────────────────────────────────────────
+
+function showPermissionDialog(evt) {
+    let dialog = document.getElementById('permission-dialog');
+    if (!dialog) {
+        dialog = document.createElement('div');
+        dialog.id = 'permission-dialog';
+        dialog.className = 'fixed inset-0 z-50 flex items-center justify-center bg-black/60';
+        dialog.innerHTML = `<div class="card w-full max-w-md bg-slate-800 border-slate-600">
+            <h3 class="font-semibold text-sm mb-2"><i class="fa-solid fa-shield-halved mr-1 text-yellow-400"></i> Tool Approval Required</h3>
+            <div id="perm-title" class="text-xs text-slate-300 mb-1"></div>
+            <div id="perm-kind" class="text-[10px] text-slate-500 mb-2"></div>
+            <div id="perm-input" class="bg-slate-900 rounded p-2 text-[10px] text-slate-400 font-mono max-h-32 overflow-y-auto mb-3 hidden"><pre class="whitespace-pre-wrap"></pre></div>
+            <div class="flex gap-2 justify-end">
+                <button onclick="resolvePermission('reject_once')" class="btn-danger text-xs px-3 py-1.5">Deny</button>
+                <button onclick="resolvePermission('allow_once')" class="btn-primary text-xs px-3 py-1.5">Allow Once</button>
+                <button onclick="resolvePermission('allow_always')" class="btn-send text-xs px-3 py-1.5">Allow Always</button>
+            </div></div>`;
+        document.body.appendChild(dialog);
+    }
+    document.getElementById('perm-title').textContent = evt.title || 'Unknown tool';
+    document.getElementById('perm-kind').textContent = 'Kind: ' + (evt.kind || 'execute');
+    const inputDiv = document.getElementById('perm-input');
+    if (evt.rawInput && Object.keys(evt.rawInput).length > 0) {
+        inputDiv.classList.remove('hidden');
+        inputDiv.querySelector('pre').textContent = JSON.stringify(evt.rawInput, null, 2);
+    } else {
+        inputDiv.classList.add('hidden');
+    }
+    dialog.classList.remove('hidden');
+    dialog._requestId = evt.requestId;
+}
+
+function closePermissionDialog() {
+    const dialog = document.getElementById('permission-dialog');
+    if (dialog) dialog.classList.add('hidden');
+}
+
+function resolvePermission(optionId) {
+    const dialog = document.getElementById('permission-dialog');
+    if (!dialog || !dialog._requestId) return;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({type: EVT.CONFIRM_PERMISSION, requestId: dialog._requestId, optionId: optionId}));
+    }
+    dialog.classList.add('hidden');
+    dialog._requestId = null;
+}
+
+// ─── File upload state ────────────────────────────────────────
+
+let uploadedFiles = [];
+async function uploadFiles(fileList) {
+    if (!fileList || fileList.length === 0) return;
+    for (const f of fileList) {
+        const ctrl = new AbortController();
+        const entry = {name: f.name, path: '', state: 'uploading', ctrl: ctrl};
+        uploadedFiles.push(entry); updateFileChips(); updateSubmitState();
+        const formData = new FormData(); formData.append('files', f);
+        try {
+            const resp = await fetch('/api/sessions/{{ session.id }}/upload', {method: 'POST', body: formData, signal: ctrl.signal});
+            const data = await resp.json();
+            entry.path = data.files[0] || ''; entry.state = 'done';
+        } catch(e) {
+            if (e.name === 'AbortError') { const idx = uploadedFiles.indexOf(entry); if (idx >= 0) uploadedFiles.splice(idx, 1); }
+            else { entry.state = 'error'; }
+        }
+        updateFileChips(); updateSubmitState();
+    }
+    document.getElementById('file-input').value = '';
+}
+function cancelUpload(index) { const e = uploadedFiles[index]; if (e && e.state === 'uploading' && e.ctrl) e.ctrl.abort(); }
+function removeFile(index) { const e = uploadedFiles[index]; if (e && e.state === 'uploading') e.ctrl.abort(); uploadedFiles.splice(index, 1); updateFileChips(); updateSubmitState(); }
+function updateSubmitState() {
+    const uploading = uploadedFiles.some(f => f.state === 'uploading');
+    const sendBtn = document.getElementById('send-btn');
+    if (uploading) { sendBtn.disabled = true; document.getElementById('prompt-input').placeholder = 'Uploading files...'; }
+    else if (!inputDisabled) { sendBtn.disabled = false; document.getElementById('prompt-input').placeholder = 'Type your message...'; }
+}
+function updateFileChips() {
+    const chips = document.getElementById('file-chips');
+    if (uploadedFiles.length === 0) { chips.classList.add('hidden'); chips.innerHTML = ''; return; }
+    chips.classList.remove('hidden');
+    chips.innerHTML = uploadedFiles.map((f, i) => {
+        let icon = f.state === 'uploading' ? '<i class="fa-solid fa-spinner fa-spin text-blue-400 text-[10px]"></i>' : f.state === 'error' ? '<i class="fa-solid fa-circle-exclamation text-red-400 text-[10px]"></i>' : '<i class="fa-solid fa-file text-purple-400 text-[10px]"></i>';
+        let action = f.state === 'uploading' ? `<button onclick="cancelUpload(${i})" class="text-slate-500 hover:text-red-400 ml-0.5">&times;</button>` : `<button onclick="removeFile(${i})" class="text-slate-500 hover:text-red-400 ml-0.5">&times;</button>`;
+        return `<span class="inline-flex items-center gap-1 bg-slate-700 border border-slate-600 rounded px-2 py-0.5 text-xs">${icon}<span class="truncate max-w-[120px] ${f.state === 'error' ? 'text-red-400 line-through' : 'text-slate-300'}">${escapeHtml(f.name)}</span>${action}</span>`;
+    }).join('');
+}
+
+// ─── Send / Interrupt / Stop ──────────────────────────────────
+
+function sendPrompt() {
+    if (inputDisabled) return;
+    if (uploadedFiles.some(f => f.state === 'uploading')) return;
+    const input = document.getElementById('prompt-input');
+    const text = input.value.trim();
+    if (!text) return;
+    removeActivityBar(); finalizeCurrentReasoning();
+    currentAssistantDiv = null; currentReasoningContent = null; currentReasoningToggle = null;
+    thinkingText = ''; todoItems = []; pendingQuestion = false;
+    currentToolDiv = null; currentToolContainer = null; toolCallCount = 0; currentRawText = '';
+    let finalText = text;
+    const doneFiles = uploadedFiles.filter(f => f.state === 'done');
+    if (doneFiles.length > 0) {
+        finalText = 'I saved some files to ' + doneFiles.map(f => f.path).join(', ') + '. ' + text;
+        uploadedFiles = uploadedFiles.filter(f => f.state !== 'done'); updateFileChips();
+    }
+    document.getElementById('prompt-input').value = '';
+    setStatus('fa-solid fa-spinner fa-spin', 'text-yellow-400', 'Sending...');
+    inputDisabled = true;
+    document.getElementById('prompt-input').disabled = true;
+    document.getElementById('send-btn').disabled = true;
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    reconnectAttempts = 0;
+    if (!ws || ws.readyState !== WebSocket.OPEN) { connect(); setStatus('fa-solid fa-spinner fa-spin', 'text-yellow-400', 'Connecting...'); waitForConnection(finalText); return; }
+    console.log('[WS] send PROMPT text=' + JSON.stringify(finalText.substring(0, 80)));
+    ws.send(JSON.stringify({type: EVT.PROMPT, text: finalText}));
+}
+function waitForConnection(text) {
+    let attempts = 0; const maxAttempts = 50;
+    const check = setInterval(() => {
+        attempts++;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            clearInterval(check); setStatus('fa-solid fa-spinner fa-spin', 'text-yellow-400', 'Sending...');
+            ws.send(JSON.stringify({type: EVT.PROMPT, text: text}));
+        } else if (ws && ws.readyState === WebSocket.CLOSED) {
+            clearInterval(check); setStatus('fa-solid fa-circle-exclamation', 'text-red-400', 'Connection failed. Refresh the page.');
+            inputDisabled = false; document.getElementById('prompt-input').disabled = false; updateSubmitState();
+        } else if (attempts >= maxAttempts) {
+            clearInterval(check); setStatus('fa-solid fa-circle-exclamation', 'text-red-400', 'Connection timeout. Refresh the page.');
+            inputDisabled = false; document.getElementById('prompt-input').disabled = false; updateSubmitState();
+        }
+    }, 200);
+}
+
+// Interrupt: cancel generation, process stays alive
+function interruptGeneration() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({type: EVT.INTERRUPT}));
+        setStatus('fa-solid fa-hand', 'text-orange-400', 'Interrupting...');
+    }
+}
+
+// Stop: close session, kill process
+function stopGeneration() {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({type: EVT.STOP}));
+        setStatus('fa-solid fa-stop', 'text-red-400', 'Stopping session...');
+    }
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div'); div.textContent = text; return div.innerHTML;
+}
+
+// ─── Mode selector ────────────────────────────────────────────
+
+function changeMode(modeId) {
+    currentMode = modeId;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({type: EVT.SET_MODE, mode: modeId}));
+    }
+    // Also save via REST for persistence
+    fetch('/api/sessions/{{ session.id }}', {
+        method: 'PUT',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({mode: modeId})
+    }).catch(e => console.error('Failed to save mode:', e));
+}
+
+// ─── Settings ─────────────────────────────────────────────────
+
+function toggleSettings() {
+    const panel = document.getElementById('settings-panel');
+    const wasHidden = panel.classList.contains('hidden');
+    panel.classList.toggle('hidden');
+    if (!wasHidden) return;
+    setTimeout(() => {
+        const handler = (e) => {
+            if (!panel.contains(e.target) && e.target !== document.getElementById('settings-btn') && !document.getElementById('settings-btn').contains(e.target)) {
+                panel.classList.add('hidden'); document.removeEventListener('click', handler);
+            }
+        };
+        document.addEventListener('click', handler);
+    }, 0);
+}
+
+// ─── Reasoning box ────────────────────────────────────────────
+
+function ensureAssistantDiv() {
+    if (currentAssistantDiv) return;
+    currentToolContainer = null; toolCallCount = 0; currentRawText = '';
+    const container = document.getElementById('messages-container');
+    currentAssistantDiv = document.createElement('div');
+    currentAssistantDiv.className = 'mb-4 pb-4 border-b border-slate-700/30';
+    currentAssistantDiv.innerHTML = `<div class="flex items-center gap-2 mb-1"><div class="w-5 h-5 rounded-full bg-blue-700 flex items-center justify-center flex-shrink-0"><i class="fa-solid fa-robot text-[10px]"></i></div><p class="text-xs text-slate-400">Claude</p></div><div class="reasoning-box hidden mb-2 border border-indigo-800/40 rounded overflow-hidden bg-[#1e1b4b]/30"><div class="reasoning-toggle flex items-center gap-1 px-2 py-1 cursor-pointer hover:bg-indigo-900/20 transition-colors border-b border-indigo-800/20 text-[0.65rem] text-purple-300" onclick="toggleInlineReasoning(this)"><span class="reasoning-chevron text-[0.55rem]">▶</span><span>Reasoning</span></div><div class="reasoning-content hidden px-2 py-1.5 text-[0.65rem] text-purple-200/80 font-mono whitespace-pre-wrap max-h-96 overflow-y-auto"></div></div><div class="text-sm markdown-content assistant-content"></div><div class="tool-calls-container hidden mt-2 border-l-2 border-purple-700/50 rounded-r-lg max-h-96 overflow-y-auto bg-slate-900/30"></div>`;
+    container.appendChild(currentAssistantDiv);
+    const rb = currentAssistantDiv.querySelector('.reasoning-box');
+    currentReasoningContent = rb ? rb.querySelector('.reasoning-content') : null;
+    currentReasoningToggle = rb ? rb.querySelector('.reasoning-toggle') : null;
+    thinkingExpanded = false;
+}
+function toggleInlineReasoning(toggleEl) {
+    const box = toggleEl.parentElement; const content = box.querySelector('.reasoning-content');
+    const chevron = toggleEl.querySelector('.reasoning-chevron');
+    const isHidden = content.classList.contains('hidden');
+    if (isHidden) { content.classList.remove('hidden'); if (chevron) chevron.textContent = '▼'; }
+    else { content.classList.add('hidden'); if (chevron) chevron.textContent = '▶'; }
+}
+function appendReasoningText(text) {
+    ensureAssistantDiv(); thinkingText += text;
+    if (currentReasoningContent && currentReasoningContent.parentElement) currentReasoningContent.parentElement.classList.remove('hidden');
+    if (!thinkingExpanded && text && currentReasoningToggle) { thinkingExpanded = true; const chevron = currentReasoningToggle.querySelector('.reasoning-chevron'); if (chevron) chevron.textContent = '▼'; }
+    if (currentReasoningContent) { currentReasoningContent.textContent = thinkingText; currentReasoningContent.classList.remove('hidden'); currentReasoningContent.scrollTop = currentReasoningContent.scrollHeight; }
+}
+function finalizeCurrentReasoning() {
+    if (currentReasoningContent && thinkingText) { const box = currentReasoningContent.closest('.reasoning-box'); if (box) box.classList.remove('hidden'); if (currentReasoningToggle) { const chevron = currentReasoningToggle.querySelector('.reasoning-chevron'); if (chevron) chevron.textContent = '▶'; } currentReasoningContent.classList.add('hidden'); }
+    thinkingExpanded = false; currentReasoningContent = null; currentReasoningToggle = null;
+}
+
+// ─── Activity bar ─────────────────────────────────────────────
+
+function ensureActivityBar() {
+    if (document.getElementById('activity-bar')) return;
+    const container = document.getElementById('messages-container');
+    const bar = document.createElement('div');
+    bar.id = 'activity-bar'; bar.className = 'activity-bar';
+    bar.innerHTML = `<div class="ab-row"><div class="ab-spinner" id="ab-spinner"></div><span class="ab-phase" id="ab-phase">Thinking...</span><span class="ab-elapsed" id="ab-elapsed">0s</span></div><div class="ab-tool hidden" id="ab-tool-section"><span class="ab-tool-name" id="ab-tool-name"></span><span class="ab-tool-args" id="ab-tool-args"></span></div><div class="ab-todos hidden" id="ab-todo-section"><div class="ab-todo-header"><span>TODOs</span><span id="ab-todo-count"></span></div><div id="ab-todo-list"></div></div><div class="ab-stdout hidden" id="ab-stdout"><pre></pre></div>`;
+    container.appendChild(bar); promptStartTime = Date.now(); lastEventTime = Date.now(); startSpinnerCheck();
+}
+function removeActivityBar() { stopSpinnerCheck(); const bar = document.getElementById('activity-bar'); if (bar) bar.remove(); currentPhase = 'IDLE'; currentSubPhase = null; currentToolName = ''; currentToolArgs = ''; stdoutTailText = ''; }
+function hideActivityBar() {
+    stopSpinnerCheck(); const bar = document.getElementById('activity-bar');
+    if (bar) { document.getElementById('ab-spinner').classList.add('hidden'); document.getElementById('ab-phase').innerHTML = '<span style="color:#4ade80;">✓</span> Done'; document.getElementById('ab-elapsed').textContent = ''; document.getElementById('ab-tool-section').classList.add('hidden'); document.getElementById('ab-stdout').classList.add('hidden'); document.getElementById('ab-todo-section').classList.add('hidden'); setTimeout(() => { if (bar.parentNode) bar.remove(); }, 3000); }
+}
+function updatePhaseLabel(text) { const el = document.getElementById('ab-phase'); if (el) el.textContent = text; }
+function updateElapsed() { const el = document.getElementById('ab-elapsed'); if (el) el.textContent = Math.round((Date.now() - promptStartTime) / 1000) + 's'; }
+function updateCurrentTool(name, args) { currentToolName = name; currentToolArgs = typeof args === 'string' ? args : JSON.stringify(args).substring(0, 200); const section = document.getElementById('ab-tool-section'); if (section) section.classList.remove('hidden'); const nameEl = document.getElementById('ab-tool-name'); if (nameEl) nameEl.textContent = name; const argsEl = document.getElementById('ab-tool-args'); if (argsEl) argsEl.textContent = currentToolArgs; }
+function updateStdoutTail(text) { stdoutTailText = text || ''; if (!stdoutTailText) return; const el = document.getElementById('ab-stdout'); if (el) { el.classList.remove('hidden'); const pre = el.querySelector('pre'); if (pre) pre.textContent = stdoutTailText; } }
+function updateTodos(todos) {
+    todoItems = todos; if (!todos.length) return;
+    const section = document.getElementById('ab-todo-section'); if (section) section.classList.remove('hidden');
+    const doneCount = todos.filter(t => t.status === 'completed').length;
+    const countEl = document.getElementById('ab-todo-count'); if (countEl) countEl.textContent = doneCount + '/' + todos.length + ' complete';
+    const listEl = document.getElementById('ab-todo-list'); if (!listEl) return;
+    listEl.innerHTML = todos.map(t => { let dot, cssClass; if (t.status === 'completed') { dot = '<span class="todo-dot" style="color:#4ade80;font-size:0.65rem;">✓</span>'; cssClass = 'done'; } else if (t.status === 'in_progress') { dot = '<span class="todo-dot" style="width:0.5rem;height:0.5rem;border-radius:50%;background:#3b82f6;display:inline-block;"></span>'; cssClass = 'in-progress'; } else { dot = '<span class="todo-dot" style="width:0.5rem;height:0.5rem;border-radius:50%;border:1px solid #475569;display:inline-block;"></span>'; cssClass = 'pending'; } return '<div class="todo-item ' + cssClass + '">' + dot + '<span class="todo-text">' + escapeHtml(t.content) + '</span></div>'; }).join('');
+}
+function startSpinnerCheck() { lastEventTime = Date.now(); if (spinnerCheckInterval) return; spinnerCheckInterval = setInterval(() => { if (currentPhase !== 'ACTIVE') return; updateElapsed(); const elapsed = Date.now() - lastEventTime; const spinner = document.getElementById('ab-spinner'); if (spinner) { if (elapsed > 2000) spinner.classList.remove('hidden'); else spinner.classList.add('hidden'); } }, 1000); }
+function stopSpinnerCheck() { if (spinnerCheckInterval) { clearInterval(spinnerCheckInterval); spinnerCheckInterval = null; } }
+function noteEventReceived() { lastEventTime = Date.now(); const spinner = document.getElementById('ab-spinner'); if (spinner) spinner.classList.add('hidden'); }
+
+// ─── Settings API ─────────────────────────────────────────────
+
+async function updateSetting(field, value) {
+    try { await fetch('/api/sessions/{{ session.id }}', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({[field]: value})}); } catch(e) { console.error(e); }
+}
+async function saveTextSetting(field) {
+    const inputId = field === 'cwd' ? 'cwd-input' : field === 'prompt' ? 'prompt-input-setting' : field + '-input';
+    const input = document.getElementById(inputId); const value = input.value;
+    const btn = input.nextElementSibling; const origHTML = btn.innerHTML;
+    btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin"></i>';
+    try { await fetch('/api/sessions/{{ session.id }}', {method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({[field]: value})}); btn.innerHTML = '<i class="fa-solid fa-check text-green-400"></i>'; }
+    catch(e) { btn.innerHTML = '<i class="fa-solid fa-xmark text-red-400"></i>'; }
+    setTimeout(() => btn.innerHTML = origHTML, 1500);
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    document.querySelectorAll('.markdown-content').forEach(el => {
+        const script = el.querySelector('script.msg-raw');
+        if (!script) return;
+        try { const raw = JSON.parse(script.textContent); el.innerHTML = renderMarkdown(raw); } catch(e) {}
+    });
+    connect();
+    const mc = document.getElementById('messages-container'); mc.scrollTop = mc.scrollHeight;
+    document.getElementById('prompt-input').addEventListener('keydown', function(e) { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendPrompt(); } });
+    // Drag-and-drop
+    const inputCard = document.getElementById('input-card'); let dragCounter = 0;
+    inputCard.addEventListener('dragenter', (e) => { e.preventDefault(); dragCounter++; inputCard.classList.add('ring-2', 'ring-purple-500'); });
+    inputCard.addEventListener('dragleave', (e) => { e.preventDefault(); dragCounter--; if (dragCounter === 0) inputCard.classList.remove('ring-2', 'ring-purple-500'); });
+    inputCard.addEventListener('dragover', (e) => { e.preventDefault(); });
+    inputCard.addEventListener('drop', (e) => { e.preventDefault(); dragCounter = 0; inputCard.classList.remove('ring-2', 'ring-purple-500'); if (e.dataTransfer.files.length > 0) uploadFiles(e.dataTransfer.files); });
+    const messagesContainer = document.getElementById('messages-container');
+    messagesContainer.addEventListener('dragover', (e) => { e.preventDefault(); });
+    messagesContainer.addEventListener('drop', (e) => { e.preventDefault(); if (e.dataTransfer.files.length > 0) uploadFiles(e.dataTransfer.files); });
+});
+</script>
+
+<style>
+@keyframes status-spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+.activity-bar { background: #0f172a; border: 1px solid #2563eb; border-radius: 0.5rem; padding: 0.5rem 0.75rem; margin-bottom: 0.75rem; font-size: 0.7rem; }
+.activity-bar .ab-row { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 0.25rem; }
+.activity-bar .ab-spinner { width: 0.85rem; height: 0.85rem; border: 2px solid #334155; border-top-color: #3b82f6; border-radius: 50%; animation: status-spin 1s linear infinite; flex-shrink: 0; }
+.activity-bar .ab-phase { color: #60a5fa; font-weight: 600; font-size: 0.7rem; }
+.activity-bar .ab-elapsed { margin-left: auto; color: #64748b; font-size: 0.6rem; }
+.activity-bar .ab-tool { border-top: 1px solid #1e293b; padding-top: 0.25rem; display: flex; align-items: center; gap: 0.25rem; }
+.activity-bar .ab-tool .ab-tool-name { color: #c084fc; font-weight: 500; font-size: 0.6rem; }
+.activity-bar .ab-tool .ab-tool-args { color: #64748b; font-size: 0.55rem; font-family: monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.activity-bar .ab-todos { margin-bottom: 0.25rem; }
+.activity-bar .ab-todo-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.125rem; color: #94a3b8; font-size: 0.6rem; }
+.activity-bar .todo-item { display: flex; align-items: center; gap: 0.25rem; padding: 0.0625rem 0; }
+.activity-bar .todo-item.done .todo-text { color: #94a3b8; text-decoration: line-through; }
+.activity-bar .todo-item.in-progress .todo-text { color: #e2e8f0; font-weight: 500; }
+.activity-bar .todo-item.pending .todo-text { color: #64748b; }
+.activity-bar .ab-stdout { background: #0a0e14; border-radius: 0.25rem; padding: 0.25rem 0.375rem; margin-top: 0.25rem; font-size: 0.6rem; color: #64748b; font-family: monospace; max-height: 1.75rem; overflow: hidden; }
+.activity-bar .ab-stdout pre { white-space: pre-wrap; word-break: break-all; margin: 0; }
+.reasoning-box { transition: all 0.15s ease; }
+.reasoning-box .reasoning-toggle { user-select: none; }
+.reasoning-box .reasoning-content::-webkit-scrollbar { width: 4px; }
+.reasoning-box .reasoning-content::-webkit-scrollbar-track { background: transparent; }
+.reasoning-box .reasoning-content::-webkit-scrollbar-thumb { background: #4338ca; border-radius: 2px; }
+</style>
+{% endblock %}
+{% block content %}
+
+<div class="flex flex-col h-screen">
+
+<!-- Top Bar -->
+<div class="flex items-center gap-2 px-1 py-0.5 flex-shrink-0 relative">
+    <button onclick="toggleSidebar()" class="w-6 h-6 rounded bg-slate-800 border border-slate-700 hover:bg-slate-700 transition-colors flex items-center justify-center flex-shrink-0" title="Menu">
+        <i class="fa-solid fa-bars text-slate-400 text-[10px]"></i>
+    </button>
+    <span class="text-xs font-semibold text-slate-400 truncate flex-1 min-w-0">{{ session.title }}</span>
+    <span id="status-indicator" class="text-[10px]"></span>
+
+    <!-- Mode dropdown (live) -->
+    <select id="mode-select" onchange="changeMode(this.value)" class="bg-slate-700 border-slate-600 text-slate-200 rounded px-1.5 py-0.5 text-[10px] outline-none" title="Permission mode">
+        {% for m in acp_modes %}
+        <option value="{{ m }}" {% if session.mode == m %}selected{% endif %}>{{ m }}</option>
+        {% endfor %}
+    </select>
+
+    <button onclick="toggleSettings()" id="settings-btn" class="text-slate-500 hover:text-slate-300 transition-colors p-0.5 rounded hover:bg-slate-700/50" title="Session Settings">
+        <i class="fa-solid fa-sliders text-xs"></i>
+    </button>
+
+    <!-- Settings Dropdown -->
+    <div id="settings-panel" class="hidden absolute right-0 top-full mt-1 z-50 w-80 card p-4 bg-slate-800 border-slate-600 shadow-2xl">
+    <div class="space-y-3 text-xs">
+        <div>
+            <label class="text-slate-400 block mb-1"><i class="fa-solid fa-microchip mr-1"></i> Model</label>
+            <select onchange="updateSetting('model', this.value)" class="w-full bg-slate-700 border-slate-600 text-slate-200 rounded px-2 py-1 text-xs outline-none">
+                {% for m in models %}
+                <option value="{{ m }}" {% if session.model == m or (not session.model and m == '') %}selected{% endif %}>{{ m or 'Default' }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div>
+            <label class="text-slate-400 block mb-1"><i class="fa-solid fa-folder mr-1"></i> Working Directory</label>
+            <div class="flex gap-1">
+                <input id="cwd-input" value="{{ session.cwd or '' }}" placeholder="CWD" class="flex-1 bg-slate-700 border-slate-600 text-slate-200 rounded px-2 py-1 outline-none text-xs">
+                <button onclick="saveTextSetting('cwd')" class="text-green-400 hover:text-green-300 text-xs px-2" title="Save"><i class="fa-solid fa-check"></i></button>
+            </div>
+        </div>
+        <div>
+            <label class="text-slate-400 block mb-1"><i class="fa-solid fa-terminal mr-1"></i> Command</label>
+            <div class="flex gap-1">
+                <input id="command-input" value="{{ session.command or 'claude' }}" placeholder="claude" class="flex-1 bg-slate-700 border-slate-600 text-slate-200 rounded px-2 py-1 outline-none text-xs font-mono">
+                <button onclick="saveTextSetting('command')" class="text-green-400 hover:text-green-300 text-xs px-2" title="Save"><i class="fa-solid fa-check"></i></button>
+            </div>
+        </div>
+        <div>
+            <label class="text-slate-400 block mb-1"><i class="fa-solid fa-gear mr-1"></i> Env Vars</label>
+            <div class="flex gap-1">
+                <textarea id="env_vars-input" placeholder="KEY=VALUE&#10;one per line" class="flex-1 bg-slate-700 border-slate-600 text-slate-200 rounded px-2 py-1 outline-none text-xs font-mono" rows="2">{{ session.env_vars or '' }}</textarea>
+                <button onclick="saveTextSetting('env_vars')" class="text-green-400 hover:text-green-300 text-xs px-2 self-start" title="Save"><i class="fa-solid fa-check"></i></button>
+            </div>
+        </div>
+        <div>
+            <label class="text-slate-400 block mb-1"><i class="fa-solid fa-message mr-1"></i> System Prompt</label>
+            <div class="flex gap-1">
+                <input id="prompt-input-setting" value="{{ session.prompt or '' }}" placeholder="System prompt..." class="flex-1 bg-slate-700 border-slate-600 text-slate-200 rounded px-2 py-1 outline-none text-xs">
+                <button onclick="saveTextSetting('prompt')" class="text-green-400 hover:text-green-300 text-xs px-2" title="Save"><i class="fa-solid fa-check"></i></button>
+            </div>
+        </div>
+        <div class="pt-2 border-t border-slate-700 space-y-1">
+            <div class="text-slate-500"><i class="fa-solid fa-clock mr-1"></i> {{ session.created_at[:19] if session.created_at else 'N/A' }}</div>
+            <div class="text-slate-500 font-mono truncate"><i class="fa-solid fa-fingerprint mr-1"></i> <span id="claude-sid">{{ session.claude_session_id if session.claude_session_id else 'N/A' }}</span></div>
+            <div class="text-slate-500"><i class="fa-solid fa-coins mr-1"></i> Tokens: <span id="token-count">{{ session.tokens_used or 0 }}</span></div>
+        </div>
+    </div>
+    </div>
+</div>
+
+<!-- Reconnect Banner -->
+<div id="reconnect-banner" class="hidden card mb-2 p-2 bg-yellow-900/20 border-yellow-700/50 flex-shrink-0">
+    <div class="flex items-center justify-between gap-2">
+        <span class="text-yellow-400 text-xs"><i class="fa-solid fa-triangle-exclamation mr-1"></i> Reconnecting in <span id="reconnect-countdown">-</span>s...</span>
+        <button onclick="manualReconnect()" class="btn-primary text-xs px-2 py-0.5"><i class="fa-solid fa-rotate mr-1"></i> Now</button>
+    </div>
+</div>
+
+<!-- Messages Area -->
+<div class="card mb-2 flex-1 overflow-y-auto" id="messages-container">
+    {% for msg in session.messages %}
+    <div class="mb-4 pb-4 border-b border-slate-700/30 last:border-b-0 last:pb-0 last:mb-0">
+        {% if msg.role == 'user' %}
+        <div class="flex gap-3 justify-end">
+            <div class="flex-1 max-w-[80%]"><p class="text-xs text-right text-slate-400 mb-1">You</p><div class="bg-blue-700/30 rounded-lg p-3 text-sm markdown-content"><script type="application/json" class="msg-raw">{{ msg.content | tojson }}</script></div></div>
+            <div class="w-8 h-8 rounded-full bg-slate-600 flex items-center justify-center flex-shrink-0"><i class="fa-solid fa-user text-xs"></i></div>
+        </div>
+        {% elif msg.role == 'assistant' %}
+        <div class="flex items-center gap-2 mb-1"><div class="w-5 h-5 rounded-full bg-blue-700 flex items-center justify-center flex-shrink-0"><i class="fa-solid fa-robot text-[10px]"></i></div><p class="text-xs text-slate-400">Claude</p></div>
+        {% if msg.reasoning %}
+        <div class="reasoning-box mb-2 border border-indigo-800/40 rounded overflow-hidden bg-[#1e1b4b]/30">
+            <div class="reasoning-toggle flex items-center gap-1 px-2 py-1 cursor-pointer hover:bg-indigo-900/20 transition-colors border-b border-indigo-800/20 text-[0.65rem] text-purple-300" onclick="toggleInlineReasoning(this)"><span class="reasoning-chevron text-[0.55rem]">▶</span><span>Reasoning</span></div>
+            <div class="reasoning-content hidden px-2 py-1.5 text-[0.65rem] text-purple-200/80 font-mono whitespace-pre-wrap max-h-96 overflow-y-auto">{{ msg.reasoning | join('') | e }}</div>
+        </div>
+        {% endif %}
+        <div class="text-sm markdown-content"><script type="application/json" class="msg-raw">{{ msg.content | tojson }}</script></div>
+        {% if msg.tools %}
+        <div class="mt-2 border-l-2 border-purple-700/50 rounded-r-lg max-h-96 overflow-y-auto bg-slate-900/30">
+            {% for tm in msg.tools %}
+            <div class="py-1.5 border-b border-slate-700/50 last:border-0">
+                <div class="flex items-center gap-2 cursor-pointer" onclick="var d=this.nextElementSibling;d.classList.toggle('hidden');var i=this.querySelector('i');i.classList.toggle('fa-chevron-right');i.classList.toggle('fa-chevron-down');"><i class="fa-solid fa-chevron-right text-[10px] text-slate-400"></i><span class="text-xs text-purple-400 font-medium">{{ tm.tool_name }}</span><span class="text-[10px] text-slate-600 ml-auto">#{{ loop.index }}</span></div>
+                <div class="hidden mt-1 space-y-1"><div class="bg-slate-900 rounded p-1.5 text-[10px] text-slate-300 font-mono overflow-x-auto"><pre class="whitespace-pre-wrap">{{ tm.tool_input or '' }}</pre></div>{% if tm.tool_result %}<div class="bg-slate-800 rounded p-1.5 text-[10px] text-green-400/80 font-mono overflow-x-auto max-h-24 overflow-y-auto"><pre class="whitespace-pre-wrap">{{ tm.tool_result[:2000] }}</pre></div>{% endif %}</div>
+            </div>
+            {% endfor %}
+        </div>
+        {% endif %}
+        {% else %}
+        <div class="flex gap-3"><div class="w-8 h-8 rounded-full bg-slate-600 flex items-center justify-center flex-shrink-0"><i class="fa-solid fa-gear text-xs"></i></div><div class="flex-1 min-w-0"><p class="text-xs text-slate-400 mb-1">System</p><div class="text-sm text-slate-400 markdown-content"><script type="application/json" class="msg-raw">{{ msg.content | tojson }}</script></div></div></div>
+        {% endif %}
+    </div>
+    {% endfor %}
+</div>
+
+<!-- Floating Status Toast -->
+<div id="status-toast" class="fixed bottom-28 left-1/2 -translate-x-1/2 z-40 opacity-0 pointer-events-none transition-opacity duration-200">
+    <div class="flex items-center gap-2 bg-slate-800 border border-slate-600 rounded-lg px-3 py-1.5 shadow-lg text-xs text-slate-300">
+        <span id="status-toast-text">Ready</span>
+        <button onclick="hideStatusToast()" class="text-slate-500 hover:text-slate-300 transition-colors ml-1" title="Dismiss">&times;</button>
+    </div>
+</div>
+
+<!-- Input Area -->
+<div class="card p-2 flex-shrink-0" id="input-card">
+    <div id="file-chips" class="flex flex-wrap gap-1 mb-1.5 hidden"></div>
+    <textarea id="prompt-input" rows="1" placeholder="Type your message..." class="w-full bg-slate-700 border border-slate-600 text-slate-100 rounded-lg px-3 py-1.5 text-sm outline-none focus:ring-2 focus:ring-blue-500 resize-none" oninput="this.style.height='';this.style.height=Math.min(this.scrollHeight,120)+'px'"></textarea>
+    <div class="flex items-center justify-between mt-1.5">
+        <button onclick="document.getElementById('file-input').click()" class="text-slate-500 hover:text-blue-400 transition-colors p-1 rounded hover:bg-slate-700/50" title="Attach files"><i class="fa-solid fa-paperclip text-sm"></i></button>
+        <div class="flex gap-1.5">
+            <button id="send-btn" onclick="sendPrompt()" class="btn-send text-xs px-3 py-1.5 flex items-center gap-1" title="Send (Enter)"><i class="fa-solid fa-paper-plane"></i> Send</button>
+            <!-- Interrupt: cancel generation, process stays alive -->
+            <button onclick="interruptGeneration()" class="btn-secondary text-xs px-3 py-1.5 flex items-center gap-1" title="Interrupt (cancel current turn)">
+                <i class="fa-solid fa-hand"></i> Interrupt
+            </button>
+            <!-- Stop: close session, kill process -->
+            <button onclick="stopGeneration()" class="btn-danger text-xs px-3 py-1.5 flex items-center gap-1" title="Stop & close session">
+                <i class="fa-solid fa-stop"></i> Stop
+            </button>
+        </div>
+    </div>
+    <input type="file" id="file-input" multiple hidden onchange="uploadFiles(this.files)" accept="*/*">
+</div>
+
+</div><!-- end flex-col -->
+
+{% endblock %}

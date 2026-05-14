@@ -1,0 +1,297 @@
+{% extends "base.html" %}
+{% block title %}Reports - Claude Code Web{% endblock %}
+{% block content %}
+
+<div class="flex items-center justify-between mb-4">
+    <div class="flex items-center gap-2">
+        <button onclick="toggleSidebar()" class="w-7 h-7 rounded-lg bg-slate-800 border border-slate-700 hover:bg-slate-700 transition-colors flex items-center justify-center flex-shrink-0" title="Menu">
+            <i class="fa-solid fa-bars text-slate-300 text-xs"></i>
+        </button>
+        <h1 class="text-xl font-bold">Reports Space <i class="fa-solid fa-folder-open ml-2 text-blue-400"></i></h1>
+    </div>
+    <div class="flex items-center gap-2">
+        <button onclick="newFolder()" class="btn-secondary text-xs"><i class="fa-solid fa-folder-plus mr-1"></i> New Folder</button>
+        <a href="/reports" class="btn-secondary text-xs"><i class="fa-solid fa-house mr-1"></i> Root</a>
+    </div>
+</div>
+
+<!-- Breadcrumbs -->
+<nav class="flex items-center gap-1 text-sm mb-4 flex-wrap" aria-label="Breadcrumb">
+    {% for bc in breadcrumbs %}
+    {% if not loop.last %}
+    <a href="/reports{% if bc.path %}?path={{ bc.path }}{% endif %}" class="text-blue-400 hover:text-blue-300">{{ bc.name }}</a>
+    <span class="text-slate-600">/</span>
+    {% else %}
+    <span class="text-slate-300 font-medium">{{ bc.name }}</span>
+    {% endif %}
+    {% endfor %}
+</nav>
+
+<!-- Upload zone -->
+<div id="upload-zone"
+     class="border-2 border-dashed border-slate-600 rounded-lg p-4 mb-3 text-center transition-colors hover:border-blue-500 cursor-pointer"
+     ondrop="onDrop(event)" ondragover="onDragOver(event)" ondragleave="onDragLeave(event)"
+     onclick="document.getElementById('report-file-input').click()">
+    <i class="fa-solid fa-cloud-arrow-up text-slate-500 text-xl mb-1 block"></i>
+    <p class="text-xs text-slate-400">Drop files here or click to upload</p>
+    <div id="upload-msg" class="hidden text-xs text-blue-400 mt-1"></div>
+</div>
+<input type="file" id="report-file-input" multiple hidden onchange="uploadReportsFiles(this.files)">
+{% set current_path = breadcrumbs|last %}
+<input type="hidden" id="upload-path" value="{% if current_path and current_path.path %}{{ current_path.path }}{% endif %}">
+
+<!-- Bulk action bar -->
+<div id="bulk-bar" class="hidden flex items-center gap-3 mb-3 px-3 py-2 bg-slate-800 border border-slate-600 rounded-lg flex-wrap">
+    <span id="bulk-count" class="text-sm text-slate-300">0 selected</span>
+    <button onclick="downloadSelected()" class="btn-secondary text-xs"><i class="fa-solid fa-download mr-1"></i> Download</button>
+    <button onclick="deleteSelected()" class="btn-danger text-xs"><i class="fa-solid fa-trash mr-1"></i> Delete</button>
+    <button onclick="clearSelection()" class="text-xs text-slate-400 hover:text-slate-200 ml-auto">Clear</button>
+</div>
+
+<div class="card overflow-x-auto p-2">
+    <table class="w-full text-xs">
+        <thead>
+            <tr class="text-left text-[10px] text-slate-500 uppercase tracking-wider border-b border-slate-700">
+                <th class="py-1 px-1.5 w-6"><input type="checkbox" onchange="toggleAll(this)" class="accent-blue-500 w-3 h-3"></th>
+                <th class="py-1 px-1.5">Name</th>
+                <th class="py-1 px-1.5 hidden sm:table-cell">Type</th>
+                <th class="py-1 px-1.5 hidden md:table-cell text-right">Size</th>
+                <th class="py-1 px-1.5 w-14"></th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for f in files %}
+            <tr class="border-b border-slate-700/50 hover:bg-slate-750 transition-colors group">
+                <td class="py-1 px-1.5">
+                    <input type="checkbox" class="row-cb accent-blue-500 w-3 h-3" data-rel="{{ f.rel }}" data-type="{{ f.type }}" onchange="updateBulkBar()">
+                </td>
+                <td class="py-1 px-1.5">
+                    {% if f.type == 'dir' %}
+                    <i class="fa-solid fa-folder text-yellow-400 mr-1.5 text-[10px]"></i>
+                    <a href="/reports{{ f.url }}" class="text-yellow-300 hover:text-yellow-200 font-medium text-xs">{{ f.name }}</a>
+                    {% else %}
+                    {% if f.name.endswith('.html') or f.name.endswith('.htm') %}
+                    <i class="fa-solid fa-globe text-blue-400 mr-1.5 text-[10px]"></i>
+                    {% elif f.name.endswith('.py') %}
+                    <i class="fa-solid fa-code text-green-400 mr-1.5 text-[10px]"></i>
+                    {% elif f.name.endswith('.md') %}
+                    <i class="fa-brands fa-markdown text-blue-400 mr-1.5 text-[10px]"></i>
+                    {% elif f.name.endswith('.txt') or f.name.endswith('.log') %}
+                    <i class="fa-solid fa-file-lines text-slate-400 mr-1.5 text-[10px]"></i>
+                    {% elif f.name.endswith('.json') or f.name.endswith('.csv') or f.name.endswith('.yaml') or f.name.endswith('.yml') %}
+                    <i class="fa-solid fa-table text-orange-400 mr-1.5 text-[10px]"></i>
+                    {% elif f.name.endswith('.png') or f.name.endswith('.jpg') or f.name.endswith('.gif') or f.name.endswith('.svg') %}
+                    <i class="fa-solid fa-image text-purple-400 mr-1.5 text-[10px]"></i>
+                    {% elif f.name.endswith('.pdf') %}
+                    <i class="fa-solid fa-file-pdf text-red-400 mr-1.5 text-[10px]"></i>
+                    {% elif f.name.endswith('.sh') or f.name.endswith('.ps1') %}
+                    <i class="fa-solid fa-terminal text-yellow-400 mr-1.5 text-[10px]"></i>
+                    {% else %}
+                    <i class="fa-solid fa-file text-slate-500 mr-1.5 text-[10px]"></i>
+                    {% endif %}
+                    <a href="{{ f.url }}" target="_blank" class="text-blue-400 hover:text-blue-300 transition-colors font-mono text-[11px]">{{ f.name }}</a>
+                    {% endif %}
+                </td>
+                <td class="py-1 px-1.5 hidden sm:table-cell text-[10px] text-slate-500">{{ f.mime or '—' }}</td>
+                <td class="py-1 px-1.5 hidden md:table-cell text-[10px] text-slate-500 text-right">
+                    {% if f.size >= 1048576 %}
+                    {{ "%.1f"|format(f.size / 1048576) }} MB
+                    {% elif f.size >= 1024 %}
+                    {{ "%.1f"|format(f.size / 1024) }} KB
+                    {% elif f.size > 0 %}
+                    {{ f.size }} B
+                    {% else %}
+                    —
+                    {% endif %}
+                </td>
+                <td class="py-1 px-1.5">
+                    <button onclick="renameItem('{{ f.rel }}', '{{ f.name|e }}')"
+                            class="opacity-0 group-hover:opacity-100 transition-opacity text-blue-400 hover:text-blue-300 p-0.5"
+                            title="Rename"><i class="fa-solid fa-pen-to-square text-[10px]"></i></button>
+                    <button onclick="deleteItem('{{ f.rel }}', {{ 'true' if f.type == 'dir' else 'false' }})"
+                            class="opacity-0 group-hover:opacity-100 transition-opacity text-red-400 hover:text-red-300 p-0.5"
+                            title="Delete"><i class="fa-solid fa-trash text-[10px]"></i></button>
+                </td>
+            </tr>
+            {% else %}
+            <tr>
+                <td colspan="5" class="py-12 text-center text-slate-500">
+                    <i class="fa-solid fa-folder-open text-2xl block mb-1"></i>
+                    <p class="text-xs">Empty directory.</p>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// ── Upload ──────────────────────────────────────────────────────
+function onDragOver(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    document.getElementById('upload-zone').classList.add('border-blue-500', 'bg-blue-900/10');
+}
+
+function onDragLeave(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    document.getElementById('upload-zone').classList.remove('border-blue-500', 'bg-blue-900/10');
+}
+
+function onDrop(e) {
+    e.preventDefault();
+    e.stopPropagation();
+    document.getElementById('upload-zone').classList.remove('border-blue-500', 'bg-blue-900/10');
+    if (e.dataTransfer.files.length > 0) {
+        uploadReportsFiles(e.dataTransfer.files);
+    }
+}
+
+async function uploadReportsFiles(fileList) {
+    if (!fileList || fileList.length === 0) return;
+    const msg = document.getElementById('upload-msg');
+    msg.classList.remove('hidden');
+    msg.innerHTML = '<i class="fa-solid fa-spinner fa-spin mr-1"></i>Uploading ' + fileList.length + ' file(s)...';
+
+    const formData = new FormData();
+    for (const f of fileList) formData.append('files', f);
+
+    const path = document.getElementById('upload-path').value || '';
+    try {
+        const r = await fetch('/api/reports/upload?path=' + encodeURIComponent(path), {
+            method: 'POST', body: formData,
+        });
+        const data = await r.json();
+        if (data.count > 0) {
+            msg.innerHTML = '<i class="fa-solid fa-check text-green-400 mr-1"></i>' + data.count + ' file(s) uploaded';
+            setTimeout(() => location.reload(), 800);
+        }
+    } catch(e) {
+        msg.innerHTML = '<span class="text-red-400"><i class="fa-solid fa-circle-exclamation mr-1"></i>Upload failed</span>';
+        setTimeout(() => msg.classList.add('hidden'), 3000);
+    }
+    document.getElementById('report-file-input').value = '';
+}
+
+// ── Bulk actions ─────────────────────────────────────────────────
+function updateBulkBar() {
+    const cbs = document.querySelectorAll('.row-cb:checked');
+    const bar = document.getElementById('bulk-bar');
+    const count = document.getElementById('bulk-count');
+    if (cbs.length > 0) {
+        bar.classList.remove('hidden');
+        count.textContent = cbs.length + ' selected';
+    } else {
+        bar.classList.add('hidden');
+    }
+}
+
+function toggleAll(el) {
+    document.querySelectorAll('.row-cb').forEach(cb => { cb.checked = el.checked; });
+    updateBulkBar();
+}
+
+function clearSelection() {
+    document.querySelectorAll('.row-cb').forEach(cb => { cb.checked = false; });
+    document.querySelector('thead input[type=checkbox]').checked = false;
+    updateBulkBar();
+}
+
+async function newFolder() {
+    const name = prompt('Folder name:');
+    if (!name || !name.trim()) return;
+    const parent = document.getElementById('upload-path').value || '';
+    try {
+        const r = await fetch('/api/reports/mkdir', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({path: parent, name: name.trim()})
+        });
+        const data = await r.json();
+        if (data.status === 'created') { location.reload(); }
+        else { alert(data.error || 'Failed'); }
+    } catch(e) { alert('Failed: ' + e); }
+}
+
+async function renameItem(rel, currentName) {
+    const newName = prompt('New name:', currentName.replace(/\/$/, ''));
+    if (!newName || !newName.trim() || newName.trim() === currentName.replace(/\/$/, '')) return;
+    try {
+        const r = await fetch('/api/reports/rename', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({path: rel, name: newName.trim()})
+        });
+        const data = await r.json();
+        if (data.status === 'renamed') { location.reload(); }
+        else { alert(data.error || 'Failed'); }
+    } catch(e) { alert('Failed: ' + e); }
+}
+
+function deleteItem(rel, isDir) {
+    const label = isDir ? 'folder "' + rel + '" and all its contents' : '"' + rel + '"';
+    if (!confirm('Delete ' + label + '?')) return;
+    fetch('/api/reports/delete', {
+        method: 'DELETE',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({path: rel})
+    }).then(r => r.json()).then(data => {
+        if (data.status === 'deleted') { location.reload(); }
+        else { alert('Error: ' + (data.error || 'unknown')); }
+    }).catch(e => { alert('Request failed: ' + e); });
+}
+
+async function downloadSelected() {
+    const cbs = document.querySelectorAll('.row-cb:checked');
+    if (cbs.length === 0) return;
+    const paths = [];
+    cbs.forEach(cb => {
+        paths.push(cb.getAttribute('data-rel'));
+    });
+    if (paths.length === 0) return;
+    try {
+        const r = await fetch('/api/reports/download', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({paths: paths})
+        });
+        if (!r.ok) { alert('Download failed'); return; }
+        const blob = await r.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'reports_download.zip';
+        a.click();
+        URL.revokeObjectURL(url);
+    } catch(e) {
+        alert('Download failed: ' + e);
+    }
+}
+
+async function deleteSelected() {
+    const cbs = document.querySelectorAll('.row-cb:checked');
+    if (cbs.length === 0) return;
+    if (!confirm('Delete ' + cbs.length + ' selected item(s)?')) return;
+    let errors = [];
+    for (const cb of cbs) {
+        const rel = cb.getAttribute('data-rel');
+        try {
+            const r = await fetch('/api/reports/delete', {
+                method: 'DELETE',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({path: rel})
+            });
+            const data = await r.json();
+            if (data.status !== 'deleted') errors.push(rel + ': ' + (data.error || 'unknown'));
+        } catch(e) {
+            errors.push(rel + ': ' + e);
+        }
+    }
+    if (errors.length > 0) { alert('Errors:\n' + errors.join('\n')); }
+    location.reload();
+}
+</script>
+{% endblock %}

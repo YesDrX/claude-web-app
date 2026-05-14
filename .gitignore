@@ -1,0 +1,29 @@
+# Logs
+error.log
+combined.log
+*.log
+
+# Database
+app.db
+app.db-journal
+app.db-wal
+app.db-shm
+
+# Config (contains secrets)
+config.toml
+.env
+
+# Generated / runtime
+reports/
+__pycache__/
+*.pyc
+.playwright-mcp/
+.venv/
+
+# OS
+Thumbs.db
+.DS_Store
+.claude/
+node_modules/
+CONTEXT.md
+ARCHITECTURE.md

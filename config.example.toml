@@ -1,0 +1,39 @@
+[auth]
+# Generate a password hash: python change_password.py your-password
+username = "admin"
+password_hash = "pbkdf2:sha256:200000$..."
+
+[server]
+host = "0.0.0.0"
+port = 8000
+
+[claude]
+# Path to the Claude CLI executable
+executable_path = "/usr/local/bin/claude"
+# Path to Claude's history file (for session import)
+history_path = "~/.claude/history.jsonl"
+# Scan additional history files from other project folders
+# history_paths = ["/home/user/project-a/.claude/history.jsonl", "/home/user/project-b/.claude/history.jsonl"]
+# Path to Claude's settings
+settings_path = "~/.claude/settings.json"
+# Path to installed plugins manifest
+plugins_path = "~/.claude/plugins/installed_plugins.json"
+# Directory for session event cache
+sessions_dir = "~/.claude/sessions"
+# Default model for new sessions (empty = Claude CLI default)
+default_model = ""
+# Available models shown in the session settings dropdown
+models = ["", "claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5-20251001"]
+
+[acp]
+# ACP subprocess idle timeout in seconds. After this much inactivity the Node
+# subprocess is torn down and respawned on the next prompt (with a resume attempt).
+idle_timeout = 1800
+
+[reports]
+# Additional paths that can be accessed via symlinks in the reports space
+allowed_paths = []
+
+[permission_profiles]
+"Fully Autonomous" = "--permission-mode bypassPermissions"
+"Default (No Tools)" = ""

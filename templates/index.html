@@ -1,0 +1,439 @@
+{% extends "base.html" %}
+{% block title %}Sessions - Claude Code Web{% endblock %}
+{% block head_extra %}
+<script>
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+
+    function copyToClipboard(text, evt) {
+        const onSuccess = () => {
+            showToast('Copied!', 'success');
+            if (evt && evt.target) {
+                const el = evt.target.closest('.copy-id');
+                if (el) {
+                    const orig = el.getAttribute('data-tooltip');
+                    el.setAttribute('data-tooltip', 'Copied!');
+                    el.classList.add('text-green-400');
+                    setTimeout(() => {
+                        el.setAttribute('data-tooltip', orig);
+                        el.classList.remove('text-green-400');
+                    }, 1500);
+                }
+            }
+        };
+        const onFail = () => {
+            showToast(text, 'show-cmd');
+        };
+
+        // Method 1: modern Clipboard API
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+            navigator.clipboard.writeText(text).then(onSuccess).catch(onFail);
+            return;
+        }
+
+        // Method 2: legacy execCommand fallback
+        try {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.left = '-9999px';
+            ta.style.top = '-9999px';
+            document.body.appendChild(ta);
+            ta.focus();
+            ta.select();
+            const ok = document.execCommand('copy');
+            document.body.removeChild(ta);
+            if (ok) { onSuccess(); } else { onFail(); }
+        } catch (e) {
+            onFail();
+        }
+    }
+
+    function copySessionId(el) {
+        const sid = el.getAttribute('data-sid');
+        const cwd = el.getAttribute('data-cwd') || '.';
+        const cmd = 'cd ' + cwd + '; claude --resume ' + sid;
+        copyToClipboard(cmd, {target: el});
+    }
+
+    function showToast(msg, type) {
+        const el = document.getElementById('toast');
+        if (type === 'show-cmd') {
+            el.innerHTML = '<p class="text-xs text-slate-400 mb-1">Copy failed — copy manually:</p><pre class="text-xs text-slate-200 whitespace-pre-wrap font-mono bg-slate-900 rounded p-2 mt-1 max-h-32 overflow-y-auto">' + escapeHtml(msg) + '</pre>';
+            el.className = 'fixed bottom-4 right-4 px-4 py-2 rounded-lg text-sm z-50 bg-slate-800 border border-slate-600 max-w-lg';
+        } else {
+            el.textContent = msg;
+            el.className = 'fixed bottom-4 right-4 px-4 py-2 rounded-lg text-sm z-50 ' +
+                (type === 'success' ? 'bg-green-700 text-green-100' : 'bg-red-700 text-red-100');
+        }
+        el.classList.remove('hidden');
+        const duration = type === 'show-cmd' ? 10000 : 2500;
+        setTimeout(() => el.classList.add('hidden'), duration);
+    }
+
+    async function createFromTemplate(tid) {
+        try {
+            const r = await fetch('/api/sessions/from-template/' + tid, { method: 'POST' });
+            const data = await r.json();
+            if (data.id) {
+                window.location.href = '/chat/' + data.id;
+            }
+        } catch(e) {
+            showToast('Failed to create session', 'error');
+        }
+    }
+
+    async function deleteSession(sid) {
+        if (!confirm('Delete this session?')) return;
+        try {
+            await fetch('/api/sessions/' + sid, { method: 'DELETE' });
+            window.location.reload();
+        } catch(e) {
+            showToast('Failed to delete', 'error');
+        }
+    }
+
+    async function bulkAction(action) {
+        const checked = [...document.querySelectorAll('.session-checkbox:checked')].map(cb => parseInt(cb.value));
+        if (!checked.length) { showToast('No sessions selected', 'error'); return; }
+        const verb = action === 'delete' ? 'Delete' : 'Interrupt';
+        if (!confirm(verb + ' ' + checked.length + ' session(s)?')) return;
+        try {
+            await fetch('/api/sessions/bulk', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({session_ids: checked, action: action})
+            });
+            window.location.reload();
+        } catch(e) {
+            showToast('Failed to ' + action, 'error');
+        }
+    }
+
+    async function scanSessions() {
+        const btn = document.getElementById('scan-btn');
+        const orig = btn.innerHTML;
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin mr-1"></i> Scanning...';
+        btn.disabled = true;
+        try {
+            const r = await fetch('/api/scan-sessions');
+            const data = await r.json();
+            const list = document.getElementById('scan-list');
+            list.innerHTML = '';
+            if (data.sessions.length === 0) {
+                list.innerHTML = '<p class="text-slate-500 text-sm p-2">No unimported sessions found.</p>';
+            } else {
+                data.sessions.forEach(s => {
+                    const row = document.createElement('div');
+                    row.className = 'scan-row flex items-center gap-3 p-2 hover:bg-slate-700 rounded';
+                    row.innerHTML = `
+                        <input type="checkbox" class="scan-checkbox" value='${JSON.stringify(s).replace(/'/g, "&#39;")}'>
+                        <div class="flex-1 min-w-0">
+                            <p class="text-sm font-medium truncate">${s.first_prompt || s.title || s.claude_session_id}</p>
+                            <p class="text-xs text-slate-500 truncate">ID: ${s.claude_session_id} | ${s.cwd || 'N/A'}${(s.source_file && s.source_file.includes('.claude')) ? ' | ' + s.source_file.replace(/\\/g,'/').split('/.claude/')[0].split('/').pop() : ''}</p>
+                        </div>`;
+                    list.appendChild(row);
+                });
+            }
+            document.getElementById('scan-modal').classList.remove('hidden');
+            document.getElementById('scan-filter').classList.remove('hidden');
+            document.getElementById('scan-filter').value = '';
+        } catch(e) {
+            showToast('Scan failed', 'error');
+        } finally {
+            btn.innerHTML = orig;
+            btn.disabled = false;
+        }
+    }
+
+    function filterScanRows() {
+        const q = document.getElementById('scan-filter').value.toLowerCase();
+        document.querySelectorAll('.scan-row').forEach(row => {
+            row.style.display = row.textContent.toLowerCase().includes(q) ? '' : 'none';
+        });
+    }
+
+    async function importSelected() {
+        const items = [...document.querySelectorAll('.scan-checkbox:checked')].map(cb => JSON.parse(cb.value));
+        if (!items.length) { showToast('Select sessions to import', 'error'); return; }
+        try {
+            const r = await fetch('/api/import-sessions', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({sessions: items})
+            });
+            await r.json();
+            document.getElementById('scan-modal').classList.add('hidden');
+            window.location.reload();
+        } catch(e) {
+            showToast('Import failed', 'error');
+        }
+    }
+
+    function toggleAll(cb) {
+        document.querySelectorAll('.session-checkbox').forEach(c => c.checked = cb.checked);
+    }
+
+    async function inlineRename(sid, currentTitle) {
+        const newTitle = prompt('New title:', currentTitle);
+        if (!newTitle || newTitle === currentTitle) return;
+        try {
+            await fetch('/api/sessions/' + sid + '/rename', {
+                method: 'PATCH',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({title: newTitle})
+            });
+            window.location.reload();
+        } catch(e) {
+            showToast('Rename failed', 'error');
+        }
+    }
+</script>
+{% endblock %}
+{% block content %}
+
+<!-- Toast -->
+<div id="toast" class="hidden fixed bottom-4 right-4 px-4 py-2 rounded-lg text-sm z-50"></div>
+
+<!-- Header -->
+<div class="flex items-center justify-between mb-4 flex-wrap gap-2">
+    <div class="flex items-center gap-2">
+        <button onclick="toggleSidebar()" class="w-7 h-7 rounded-lg bg-slate-800 border border-slate-700 hover:bg-slate-700 transition-colors flex items-center justify-center flex-shrink-0" title="Menu">
+            <i class="fa-solid fa-bars text-slate-300 text-xs"></i>
+        </button>
+        <h1 class="text-xl font-bold">Sessions <i class="fa-solid fa-list-check ml-2 text-blue-400"></i></h1>
+    </div>
+    <div class="flex gap-2">
+        <button onclick="document.getElementById('new-session-form').classList.toggle('hidden')" class="btn-primary text-sm">
+            <i class="fa-solid fa-plus mr-1"></i> New Session
+        </button>
+        <button id="scan-btn" onclick="scanSessions()" class="btn-secondary text-sm">
+            <i class="fa-solid fa-magnifying-glass mr-1"></i> Scan to Load
+        </button>
+    </div>
+</div>
+
+<!-- Quick Start: Templates -->
+{% if templates %}
+<div class="mb-5">
+    <h2 class="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-2">
+        <i class="fa-solid fa-bolt mr-1 text-yellow-400"></i> Quick Start
+    </h2>
+    <div class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
+        {% for t in templates %}
+        <div onclick="createFromTemplate({{ t.id }})"
+             class="card cursor-pointer hover:border-blue-500 hover:bg-slate-750 transition-all duration-150 group">
+            <div class="flex items-start justify-between">
+                <div class="min-w-0 flex-1">
+                    <p class="font-medium text-sm truncate">{{ t.name }}</p>
+                    <p class="text-xs text-slate-400 truncate mt-0.5">{{ t.title or 'No default title' }}</p>
+                </div>
+                <i class="fa-solid fa-play text-slate-600 group-hover:text-blue-400 transition-colors ml-2 mt-0.5"></i>
+            </div>
+            <div class="flex gap-2 mt-2 text-xs text-slate-500">
+                {% if t.model %}<span class="bg-slate-700 px-1.5 py-0.5 rounded">{{ t.model }}</span>{% endif %}
+                {% if t.mode != 'bypassPermissions' %}<span class="bg-slate-700 px-1.5 py-0.5 rounded">{{ t.mode }}</span>{% endif %}
+                {% if t.cwd %}<span class="bg-slate-700 px-1.5 py-0.5 rounded truncate max-w-[120px]">{{ t.cwd }}</span>{% endif %}
+            </div>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+{% endif %}
+
+<!-- New Session Form -->
+<div id="new-session-form" class="card mb-5 hidden">
+    <h3 class="font-semibold mb-3 text-sm"><i class="fa-solid fa-pen-to-square mr-1"></i> New Custom Session</h3>
+    <form method="post" action="/api/sessions" id="create-session-form" class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div>
+            <label class="block text-xs text-slate-400 mb-1">Title</label>
+            <input name="title" class="w-full bg-slate-700 border border-slate-600 text-slate-100 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500" placeholder="Session title">
+        </div>
+        <div>
+            <label class="block text-xs text-slate-400 mb-1">Working Directory</label>
+            <input name="cwd" class="w-full bg-slate-700 border border-slate-600 text-slate-100 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500" placeholder="e.g. C:\Users\username\claude">
+        </div>
+        <div>
+            <label class="block text-xs text-slate-400 mb-1">Model</label>
+            <input name="model" class="w-full bg-slate-700 border border-slate-600 text-slate-100 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500" placeholder="{{ default_model or 'claude-sonnet-4-6' }}">
+        </div>
+        <div>
+            <label class="block text-xs text-slate-400 mb-1">Mode</label>
+            <select name="mode" class="w-full bg-slate-700 border border-slate-600 text-slate-100 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500">
+                <option value="bypassPermissions" selected>bypassPermissions (YOLO)</option>
+                <option value="default">default</option>
+                <option value="acceptEdits">acceptEdits</option>
+                <option value="plan">plan</option>
+            </select>
+        </div>
+        <div>
+            <label class="block text-xs text-slate-400 mb-1">Command</label>
+            <input name="command" value="claude" class="w-full bg-slate-700 border border-slate-600 text-slate-100 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500" placeholder="claude">
+        </div>
+        <div>
+            <label class="block text-xs text-slate-400 mb-1">Env Vars <span class="text-slate-600">(KEY=VALUE, one per line)</span></label>
+            <textarea name="env_vars" rows="2" class="w-full bg-slate-700 border border-slate-600 text-slate-100 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500 font-mono" placeholder="ANTHROPIC_BASE_URL=https://..."></textarea>
+        </div>
+        <div class="sm:col-span-2">
+            <label class="block text-xs text-slate-400 mb-1">System Prompt / Instructions</label>
+            <textarea name="prompt" rows="2" class="w-full bg-slate-700 border border-slate-600 text-slate-100 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500" placeholder="Optional system prompt..."></textarea>
+        </div>
+        <div class="sm:col-span-2 flex justify-end gap-2">
+            <button type="button" onclick="document.getElementById('new-session-form').classList.add('hidden')" class="btn-secondary text-sm">Cancel</button>
+            <button type="submit" class="btn-primary text-sm"><i class="fa-solid fa-plus mr-1"></i> Create & Open</button>
+        </div>
+    </form>
+</div>
+
+<!-- Search Bar -->
+<div class="flex items-center gap-2 mb-3">
+    <form method="get" action="/" class="flex-1 flex gap-2">
+        <div class="relative flex-1">
+            <i class="fa-solid fa-search absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 text-sm"></i>
+            <input name="search" value="{{ search }}" placeholder="Search sessions..."
+                class="w-full bg-slate-800 border border-slate-700 text-slate-100 rounded-lg pl-9 pr-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500">
+        </div>
+        <button type="submit" class="btn-secondary text-sm">Search</button>
+        {% if search %}<a href="/" class="btn-secondary text-sm">Clear</a>{% endif %}
+    </form>
+</div>
+
+<!-- Bulk Actions -->
+<div class="flex items-center gap-2 mb-2" id="bulk-actions" style="display:none;">
+    <span class="text-xs text-slate-400" id="selected-count">0 selected</span>
+    <button onclick="bulkAction('interrupt')" class="btn-secondary text-xs py-1 px-2"><i class="fa-solid fa-stop mr-1"></i> Interrupt</button>
+    <button onclick="bulkAction('delete')" class="btn-danger text-xs py-1 px-2"><i class="fa-solid fa-trash mr-1"></i> Delete</button>
+</div>
+
+<!-- Sessions Table -->
+<div class="card overflow-x-auto">
+    <table class="w-full text-sm">
+        <thead>
+            <tr class="text-left text-xs text-slate-400 uppercase tracking-wider border-b border-slate-700">
+                <th class="p-2 w-8"><input type="checkbox" onchange="toggleAll(this)" class="rounded"></th>
+                <th class="p-2">Session</th>
+                <th class="p-2 hidden sm:table-cell">ID</th>
+                <th class="p-2 hidden md:table-cell">Model</th>
+                <th class="p-2 hidden lg:table-cell">Mode</th>
+                <th class="p-2">Status</th>
+                <th class="p-2 hidden md:table-cell">Tokens</th>
+                <th class="p-2 hidden lg:table-cell">Created</th>
+                <th class="p-2 text-right">Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for s in sessions %}
+            <tr class="border-b border-slate-700/50 hover:bg-slate-750 transition-colors group">
+                <td class="p-2">
+                    <input type="checkbox" class="session-checkbox rounded" value="{{ s.id }}"
+                        onchange="(function(){ const c = document.querySelectorAll('.session-checkbox:checked').length; document.getElementById('selected-count').textContent = c + ' selected'; document.getElementById('bulk-actions').style.display = c ? 'flex' : 'none'; })()">
+                </td>
+                <td class="p-2 min-w-[150px]">
+                    <a href="/chat/{{ s.id }}" class="font-medium text-blue-400 hover:text-blue-300 transition-colors block truncate max-w-[250px]"
+                       title="Double-click to rename">{{ s.title or 'Untitled' }}</a>
+                    <button onclick="inlineRename({{ s.id }}, '{{ s.title|e }}')"
+                            class="text-xs text-slate-600 hover:text-slate-400 opacity-0 group-hover:opacity-100 transition-opacity"
+                            title="Rename">
+                        <i class="fa-solid fa-pen text-[10px]"></i>
+                    </button>
+                </td>
+                <td class="p-2 hidden sm:table-cell">
+                    {% if s.claude_session_id %}
+                    <span class="copy-id text-xs text-slate-400 font-mono cursor-pointer hover:text-blue-400 transition-colors relative"
+                          data-sid="{{ s.claude_session_id }}"
+                          data-cwd="{{ s.cwd or '.' }}"
+                          data-tooltip="Click to copy: cd {{ s.cwd or '.' }}; claude --resume {{ s.claude_session_id }}"
+                          onclick="copySessionId(this)"
+                          title="">
+                        {{ s.claude_session_id[:16] }}
+                        <i class="fa-regular fa-copy ml-1 text-[10px] opacity-50"></i>
+                    </span>
+                    {% else %}
+                    <span class="text-xs text-slate-600">—</span>
+                    {% endif %}
+                </td>
+                <td class="p-2 hidden md:table-cell text-xs text-slate-400">{{ s.model or '—' }}</td>
+                <td class="p-2 hidden lg:table-cell text-xs text-slate-400">{{ s.mode }}</td>
+                <td class="p-2">
+                    {% if s.status == 'Working' %}
+                    <span class="inline-flex items-center gap-1 text-xs bg-yellow-900/50 text-yellow-300 px-2 py-0.5 rounded-full">
+                        <i class="fa-solid fa-spinner fa-spin text-[10px]"></i> Working
+                    </span>
+                    {% elif s.status == 'Error' %}
+                    <span class="inline-flex items-center gap-1 text-xs bg-red-900/50 text-red-300 px-2 py-0.5 rounded-full">
+                        <i class="fa-solid fa-circle-exclamation"></i> Error
+                    </span>
+                    {% else %}
+                    <span class="inline-flex items-center gap-1 text-xs bg-green-900/50 text-green-300 px-2 py-0.5 rounded-full">
+                        <i class="fa-solid fa-circle text-[6px]"></i> Idle
+                    </span>
+                    {% endif %}
+                </td>
+                <td class="p-2 hidden md:table-cell text-xs text-slate-400">{{ s.tokens_used or 0 }}</td>
+                <td class="p-2 hidden lg:table-cell text-xs text-slate-500">{{ s.created_at[:10] if s.created_at else '—' }}</td>
+                <td class="p-2 text-right">
+                    <a href="/chat/{{ s.id }}" class="text-blue-400 hover:text-blue-300 text-xs mr-2" title="Open chat">
+                        <i class="fa-solid fa-comments"></i>
+                    </a>
+                    <button onclick="deleteSession({{ s.id }})" class="text-red-400 hover:text-red-300 text-xs" title="Delete">
+                        <i class="fa-solid fa-trash"></i>
+                    </button>
+                </td>
+            </tr>
+            {% else %}
+            <tr>
+                <td colspan="9" class="p-8 text-center text-slate-500">
+                    <i class="fa-solid fa-inbox text-3xl block mb-2"></i>
+                    <p>No sessions yet. Create one or scan for existing sessions.</p>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<!-- Scan Modal -->
+<div id="scan-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4">
+    <div class="card w-full max-w-lg max-h-[80vh] flex flex-col">
+        <div class="flex items-center justify-between mb-3">
+            <h3 class="font-semibold"><i class="fa-solid fa-magnifying-glass mr-2 text-blue-400"></i>Scan Results</h3>
+            <button onclick="document.getElementById('scan-modal').classList.add('hidden')" class="text-slate-400 hover:text-white">
+                <i class="fa-solid fa-xmark text-lg"></i>
+            </button>
+        </div>
+        <input id="scan-filter" oninput="filterScanRows()" type="text" placeholder="Filter sessions..."
+               class="input-dark text-xs mb-2 hidden" autocomplete="off">
+        <div id="scan-list" class="flex-1 overflow-y-auto space-y-2 min-h-[120px]">
+            <p class="text-slate-500 text-sm p-2">Scanning...</p>
+        </div>
+        <div class="flex justify-end gap-2 mt-4 pt-3 border-t border-slate-700">
+            <button onclick="document.getElementById('scan-modal').classList.add('hidden')" class="btn-secondary text-sm">Cancel</button>
+            <button onclick="importSelected()" class="btn-primary text-sm"><i class="fa-solid fa-download mr-1"></i> Import Selected</button>
+        </div>
+    </div>
+</div>
+
+<!-- Inline JS: handle form submit via fetch -->
+<script>
+document.getElementById('create-session-form').addEventListener('submit', async function(e) {
+    e.preventDefault();
+    const fd = new FormData(this);
+    const body = Object.fromEntries(fd.entries());
+    try {
+        const r = await fetch('/api/sessions', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body)
+        });
+        const data = await r.json();
+        if (data.id) window.location.href = '/chat/' + data.id;
+        else showToast('Failed to create session', 'error');
+    } catch(err) {
+        showToast('Error: ' + err.message, 'error');
+    }
+});
+</script>
+{% endblock %}

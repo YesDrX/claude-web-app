@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en" class="h-full">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{% block title %}Claude Code Web{% endblock %}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            safelist: [
+                'bg-blue-700', 'bg-blue-700/30', 'bg-purple-700', 'bg-red-700', 'bg-slate-600',
+                'bg-slate-700', 'bg-slate-800', 'bg-slate-800/50', 'bg-slate-900',
+                'bg-green-700', 'bg-green-900/50', 'bg-red-900/50', 'bg-yellow-900/50',
+                'text-blue-400', 'text-purple-400', 'text-green-400', 'text-red-400', 'text-yellow-400',
+                'text-green-300', 'text-red-300', 'text-yellow-300', 'text-slate-300', 'text-slate-400',
+                'text-slate-500', 'text-slate-600', 'text-slate-100', 'text-slate-200',
+                'text-xs', 'text-sm', 'text-lg', 'text-[10px]', 'text-[6px]',
+                'rounded-full', 'rounded-lg', 'rounded-xl', 'rounded',
+                'w-8', 'h-8', 'w-10', 'h-10', 'w-2', 'h-2', 'h-5', 'w-48',
+                'flex-shrink-0', 'min-w-0', 'min-h-[120px]',
+                'whitespace-pre-wrap', 'font-mono', 'font-medium', 'font-semibold',
+                'overflow-x-auto', 'overflow-y-auto',
+                'prose', 'prose-invert',
+                'p-2', 'p-3', 'p-4', 'px-2', 'py-1', 'py-2', 'px-3', 'py-0.5',
+                'mt-1', 'mt-2', 'mb-1', 'mb-2', 'mb-3', 'mb-4', 'mr-1', 'mr-2', 'ml-2',
+                'gap-1', 'gap-2', 'gap-3',
+                'border', 'border-slate-700', 'border-slate-600',
+                'opacity-0', 'group-hover:opacity-100',
+                'transition-opacity', 'transition-colors',
+                'max-w-[250px]', 'max-w-[80%]', 'max-w-[120px]', 'max-w-[200px]',
+                'hover:bg-slate-700', 'hover:text-blue-400',
+                'whitespace-nowrap', 'truncate', 'block', 'inline-flex',
+            ],
+            theme: {
+                extend: {
+                    colors: {
+                        dark: { 900: '#0f172a', 800: '#1e293b', 700: '#334155', 600: '#475569' }
+                    }
+                }
+            }
+        }
+    </script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+    <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.13.3/dist/cdn.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <style>
+        html, body { background-color: #0f172a; color: #e2e8f0; }
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: #1e293b; }
+        ::-webkit-scrollbar-thumb { background: #475569; border-radius: 3px; }
+        @keyframes fa-spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .fa-spin {
+            animation: fa-spin 2s linear infinite;
+        }
+        @keyframes fa-beat {
+            0%, 90% { transform: scale(1); }
+            45% { transform: scale(1.25); }
+        }
+        .fa-beat {
+            animation: fa-beat 1s ease infinite;
+        }
+        .input-dark {
+            background-color: #334155; border-color: #475569; color: #e2e8f0;
+            border-radius: 0.5rem; padding: 0.5rem 0.75rem; outline: none;
+        }
+        .input-dark:focus { ring: 2px solid #3b82f6; border-color: #3b82f6; }
+        .btn-primary {
+            background-color: #2563eb; color: #fff; font-weight: 500;
+            padding: 0.5rem 1rem; border-radius: 0.5rem; transition: background-color 0.15s;
+            display: inline-flex; align-items: center; justify-content: center; border: none; cursor: pointer;
+        }
+        .btn-primary:hover { background-color: #1d4ed8; }
+        .btn-danger {
+            background-color: #dc2626; color: #fff; font-weight: 500;
+            padding: 0.5rem 1rem; border-radius: 0.5rem; transition: background-color 0.15s;
+            display: inline-flex; align-items: center; justify-content: center; border: none; cursor: pointer;
+        }
+        .btn-danger:hover { background-color: #b91c1c; }
+        .btn-secondary {
+            background-color: #475569; color: #fff; font-weight: 500;
+            padding: 0.5rem 1rem; border-radius: 0.5rem; transition: background-color 0.15s;
+            display: inline-flex; align-items: center; justify-content: center; border: none; cursor: pointer;
+        }
+        .btn-secondary:hover { background-color: #64748b; }
+        .btn-send {
+            background-color: #16a34a; color: #fff; font-weight: 500;
+            padding: 0.5rem 1rem; border-radius: 0.5rem; transition: background-color 0.15s;
+            display: inline-flex; align-items: center; justify-content: center; border: none; cursor: pointer;
+        }
+        .btn-send:hover { background-color: #15803d; }
+        .btn-send:disabled { background-color: #475569; color: #94a3b8; cursor: not-allowed; }
+        .card {
+            background-color: #1e293b; border: 1px solid #334155; border-radius: 0.75rem; padding: 1rem;
+        }
+        .bg-slate-750 { background-color: #1e293b; }
+        .hover\:bg-slate-750:hover { background-color: #233044; }
+
+        /* Markdown content styles */
+        .markdown-content h1 { font-size: 1.25rem; font-weight: 700; color: #e2e8f0; margin: 1rem 0 0.5rem; border-bottom: 1px solid #334155; padding-bottom: 0.25rem; }
+        .markdown-content h2 { font-size: 1.1rem; font-weight: 700; color: #e2e8f0; margin: 0.75rem 0 0.5rem; }
+        .markdown-content h3, .markdown-content h4 { font-size: 1rem; font-weight: 600; color: #cbd5e1; margin: 0.5rem 0 0.25rem; }
+        .markdown-content p { margin: 0.25rem 0 0.5rem; }
+        .markdown-content p:first-child { margin-top: 0; }
+        .markdown-content p:last-child { margin-bottom: 0; }
+        .markdown-content ul, .markdown-content ol { margin: 0.25rem 0; padding-left: 1.25rem; }
+        .markdown-content li { margin: 0.125rem 0; }
+        .markdown-content ul { list-style-type: disc; }
+        .markdown-content ol { list-style-type: decimal; }
+        .markdown-content blockquote {
+            margin: 0.5rem 0; padding: 0.25rem 0.75rem;
+            border-left: 3px solid #6366f1;
+            background: rgba(99, 102, 241, 0.08);
+            color: #a5b4fc;
+        }
+        .markdown-content code {
+            background: #1e293b; color: #f472b6;
+            padding: 0.1rem 0.3rem; border-radius: 0.25rem;
+            font-size: 0.8em; font-family: ui-monospace, 'Cascadia Code', 'Source Code Pro', Menlo, Consolas, monospace;
+        }
+        .markdown-content pre {
+            background: #0f172a; border: 1px solid #334155;
+            padding: 0.75rem; border-radius: 0.5rem;
+            overflow-x: auto; margin: 0.5rem 0;
+        }
+        .markdown-content pre code {
+            background: none; color: #e2e8f0;
+            padding: 0; border-radius: 0;
+            font-size: 0.75rem;
+        }
+        .markdown-content table {
+            border-collapse: collapse; margin: 0.5rem 0;
+            font-size: 0.8rem; width: 100%;
+        }
+        .markdown-content th {
+            background: #1e293b; color: #94a3b8; font-weight: 600;
+            padding: 0.35rem 0.75rem; text-align: left;
+            border: 1px solid #334155;
+        }
+        .markdown-content td {
+            padding: 0.25rem 0.75rem; border: 1px solid #334155;
+            color: #cbd5e1;
+        }
+        .markdown-content tr:nth-child(even) td { background: rgba(30, 41, 59, 0.5); }
+        .markdown-content hr { border: none; border-top: 1px solid #334155; margin: 0.75rem 0; }
+        .markdown-content a { color: #60a5fa; text-decoration: underline; }
+        .markdown-content a:hover { color: #93bbfd; }
+        .markdown-content img { max-width: 100%; border-radius: 0.5rem; margin: 0.5rem 0; }
+        .markdown-content strong { color: #f1f5f9; }
+    </style>
+    {% block head_extra %}{% endblock %}
+    <style>
+        .sidebar { display: none !important; }
+        .sidebar.open { display: flex !important; }
+        .sidebar-backdrop { display: none !important; }
+        .sidebar-backdrop.show { display: block !important; }
+    </style>
+</head>
+<body class="h-full bg-slate-900 text-slate-100">
+    <!-- Sidebar Backdrop -->
+    <div id="sidebar-backdrop" class="sidebar-backdrop fixed inset-0 bg-black/60 z-40" onclick="closeSidebar()"></div>
+
+    <!-- Sidebar -->
+    <aside id="sidebar" class="sidebar fixed top-0 left-0 h-full w-64 bg-slate-800 border-r border-slate-700 z-50 flex flex-col shadow-2xl">
+        <!-- Brand -->
+        <div class="px-5 py-4 border-b border-slate-700">
+            <a href="/" class="text-lg font-bold text-blue-400 hover:text-blue-300 transition-colors" onclick="closeSidebar()">
+                <i class="fa-solid fa-terminal mr-1"></i> Claude Code Web
+            </a>
+            <div class="text-[10px] text-slate-500 mt-0.5">v1.0</div>
+        </div>
+        <!-- Nav Links -->
+        <nav class="flex-1 px-3 py-3 space-y-1">
+            <a href="/" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-700 transition-colors text-sm {% if request.url.path == '/' %}bg-slate-700 text-blue-400{% else %}text-slate-300{% endif %}" onclick="closeSidebar()">
+                <i class="fa-solid fa-list-check w-4 text-center"></i> Sessions
+            </a>
+            <a href="/templates" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-700 transition-colors text-sm {% if request.url.path == '/templates' %}bg-slate-700 text-blue-400{% else %}text-slate-300{% endif %}" onclick="closeSidebar()">
+                <i class="fa-solid fa-layer-group w-4 text-center"></i> Templates
+            </a>
+            <a href="/reports" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-700 transition-colors text-sm {% if request.url.path == '/reports' %}bg-slate-700 text-blue-400{% else %}text-slate-300{% endif %}" onclick="closeSidebar()">
+                <i class="fa-solid fa-folder-open w-4 text-center"></i> Reports
+            </a>
+            <a href="/settings" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-700 transition-colors text-sm {% if request.url.path == '/settings' %}bg-slate-700 text-blue-400{% else %}text-slate-300{% endif %}" onclick="closeSidebar()">
+                <i class="fa-solid fa-gear w-4 text-center"></i> Settings
+            </a>
+        </nav>
+        <!-- Logout -->
+        <div class="px-3 py-3 border-t border-slate-700">
+            <a href="/logout" class="flex items-center gap-3 px-3 py-2.5 rounded-lg hover:bg-slate-700 transition-colors text-sm text-slate-400 hover:text-red-400">
+                <i class="fa-solid fa-right-from-bracket w-4 text-center"></i> Logout
+            </a>
+        </div>
+    </aside>
+
+    <main class="w-full px-3 py-3">
+        {% block content %}{% endblock %}
+    </main>
+    <script>
+        function toggleSidebar() {
+            const s = document.getElementById('sidebar');
+            const b = document.getElementById('sidebar-backdrop');
+            s.classList.toggle('open');
+            b.classList.toggle('show');
+        }
+        function closeSidebar() {
+            document.getElementById('sidebar').classList.remove('open');
+            document.getElementById('sidebar-backdrop').classList.remove('show');
+        }
+        // Close sidebar on Escape key
+        document.addEventListener('keydown', function(e) {
+            if (e.key === 'Escape') closeSidebar();
+        });
+    </script>
+    {% block scripts %}{% endblock %}
+</body>
+</html>

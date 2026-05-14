@@ -1,0 +1,247 @@
+{% extends "base.html" %}
+{% block title %}Templates - Claude Code Web{% endblock %}
+{% block head_extra %}
+<script>
+    function showToast(msg, type) {
+        const el = document.getElementById('toast');
+        el.textContent = msg;
+        el.className = 'fixed bottom-4 right-4 px-4 py-2 rounded-lg text-sm z-50 ' +
+            (type === 'success' ? 'bg-green-700 text-green-100' : 'bg-red-700 text-red-100');
+        el.classList.remove('hidden');
+        setTimeout(() => el.classList.add('hidden'), 2500);
+    }
+
+    async function createTemplate() {
+        const fd = new FormData(document.getElementById('add-form'));
+        const body = Object.fromEntries(fd.entries());
+        try {
+            const r = await fetch('/api/templates', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(body)
+            });
+            if (r.ok) { window.location.reload(); }
+            else { showToast('Failed to create template', 'error'); }
+        } catch(e) { showToast('Error', 'error'); }
+    }
+
+    async function deleteTemplate(tid) {
+        if (!confirm('Delete this template?')) return;
+        try {
+            await fetch('/api/templates/' + tid, { method: 'DELETE' });
+            window.location.reload();
+        } catch(e) { showToast('Failed to delete', 'error'); }
+    }
+
+    function editTemplate(tid) {
+        const row = document.getElementById('template-row-' + tid);
+        const cells = row.querySelectorAll('[data-field]');
+        const orig = {};
+        cells.forEach(cell => {
+            const field = cell.dataset.field;
+            orig[field] = cell.dataset.value || '';
+            const val = cell.dataset.value || '';
+            if (field === 'mode') {
+                cell.innerHTML = `<select data-edited="true" data-orig="${escapeHtml(orig[field])}" onchange="markDirty(${tid})" class="bg-slate-700 border border-slate-600 text-slate-100 rounded px-2 py-1 text-xs outline-none">
+                    <option value="bypassPermissions" ${val === 'bypassPermissions' ? 'selected' : ''}>bypassPermissions</option>
+                    <option value="default" ${val === 'default' ? 'selected' : ''}>default</option>
+                    <option value="acceptEdits" ${val === 'acceptEdits' ? 'selected' : ''}>acceptEdits</option>
+                    <option value="plan" ${val === 'plan' ? 'selected' : ''}>plan</option>
+                </select>`;
+            } else if (field === 'env_vars') {
+                cell.innerHTML = `<textarea data-edited="true" data-orig="${escapeHtml(orig[field])}" data-field="${field}"
+                    oninput="markDirty(${tid})" rows="3"
+                    class="w-full bg-slate-700 border border-slate-600 text-slate-100 rounded px-2 py-1 text-xs outline-none font-mono">${escapeHtml(val)}</textarea>`;
+            } else {
+                cell.innerHTML = `<input value="${escapeHtml(val)}" data-edited="true" data-orig="${escapeHtml(orig[field])}" data-field="${field}"
+                    oninput="markDirty(${tid})"
+                    class="w-full bg-slate-700 border border-slate-600 text-slate-100 rounded px-2 py-1 text-xs outline-none">`;
+            }
+        });
+        // Show save/cancel buttons
+        const actions = row.querySelector('td:last-child');
+        actions.innerHTML = `
+            <button onclick="saveAllEdits(${tid})" class="text-green-400 hover:text-green-300 text-xs mr-2" title="Save">${'<i class="fa-solid fa-check"></i>'}</button>
+            <button onclick="cancelEdits(${tid})" class="text-slate-400 hover:text-white text-xs" title="Cancel">${'<i class="fa-solid fa-xmark"></i>'}</button>`;
+    }
+
+    function markDirty(tid) {
+        const row = document.getElementById('template-row-' + tid);
+        const btn = row.querySelector('button[title="Save"]');
+        if (btn) btn.classList.add('animate-pulse');
+    }
+
+    async function saveAllEdits(tid) {
+        const row = document.getElementById('template-row-' + tid);
+        const edited = row.querySelectorAll('[data-edited]');
+        const updates = {};
+        for (const el of edited) {
+            const field = el.dataset.field || (el.tagName === 'SELECT' ? 'mode' : '');
+            if (field) updates[field] = el.value;
+        }
+        try {
+            await fetch('/api/templates/' + tid, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(updates)
+            });
+            for (const el of edited) {
+                el.dataset.value = el.value;
+                el.dataset.orig = el.value;
+            }
+            showToast('Saved', 'success');
+            window.location.reload();
+        } catch(e) { showToast('Save failed', 'error'); }
+    }
+
+    function cancelEdits(tid) {
+        const row = document.getElementById('template-row-' + tid);
+        const edited = row.querySelectorAll('[data-edited]');
+        for (const el of edited) {
+            const orig = el.dataset.orig || '';
+            if (el.tagName === 'SELECT') {
+                el.value = orig;
+                el.outerHTML = el.outerHTML; // Reset
+            }
+        }
+        window.location.reload();
+    }
+
+    async function saveEdit(tid, field, value) {
+        try {
+            await fetch('/api/templates/' + tid, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({[field]: value})
+            });
+            showToast('Saved', 'success');
+        } catch(e) { showToast('Save failed', 'error'); }
+    }
+
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text;
+        return div.innerHTML;
+    }
+</script>
+{% endblock %}
+{% block content %}
+<div id="toast" class="hidden fixed bottom-4 right-4 px-4 py-2 rounded-lg text-sm z-50"></div>
+
+<div class="flex items-center justify-between mb-4">
+    <div class="flex items-center gap-2">
+        <button onclick="toggleSidebar()" class="w-7 h-7 rounded-lg bg-slate-800 border border-slate-700 hover:bg-slate-700 transition-colors flex items-center justify-center flex-shrink-0" title="Menu">
+            <i class="fa-solid fa-bars text-slate-300 text-xs"></i>
+        </button>
+        <h1 class="text-xl font-bold">Templates <i class="fa-solid fa-layer-group ml-2 text-blue-400"></i></h1>
+    </div>
+    <a href="/templates" class="btn-secondary text-sm"><i class="fa-solid fa-rotate mr-1"></i> Refresh</a>
+</div>
+
+<!-- Add Template Form -->
+<div class="card mb-5">
+    <h3 class="font-semibold mb-3 text-sm"><i class="fa-solid fa-plus mr-1"></i> New Template</h3>
+    <form id="add-form" onsubmit="event.preventDefault(); createTemplate();" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+        <div>
+            <label class="block text-xs text-slate-400 mb-1">Name *</label>
+            <input name="name" required class="w-full bg-slate-700 border border-slate-600 text-slate-100 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500" placeholder="e.g. Dev Helper">
+        </div>
+        <div>
+            <label class="block text-xs text-slate-400 mb-1">Default Title</label>
+            <input name="title" class="w-full bg-slate-700 border border-slate-600 text-slate-100 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500" placeholder="Session title">
+        </div>
+        <div>
+            <label class="block text-xs text-slate-400 mb-1">Working Directory</label>
+            <input name="cwd" class="w-full bg-slate-700 border border-slate-600 text-slate-100 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500" placeholder="e.g. C:\Users\username\claude">
+        </div>
+        <div>
+            <label class="block text-xs text-slate-400 mb-1">Model</label>
+            <input name="model" class="w-full bg-slate-700 border border-slate-600 text-slate-100 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500" placeholder="{{ default_model }}">
+        </div>
+        <div>
+            <label class="block text-xs text-slate-400 mb-1">Mode</label>
+            <select name="mode" class="w-full bg-slate-700 border border-slate-600 text-slate-100 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500">
+                <option value="bypassPermissions" selected>bypassPermissions (YOLO)</option>
+                <option value="default">default</option>
+                <option value="acceptEdits">acceptEdits</option>
+                <option value="plan">plan</option>
+            </select>
+        </div>
+        <div>
+            <label class="block text-xs text-slate-400 mb-1">Command</label>
+            <input name="command" value="claude" class="w-full bg-slate-700 border border-slate-600 text-slate-100 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500" placeholder="claude">
+        </div>
+        <div class="sm:col-span-2">
+            <label class="block text-xs text-slate-400 mb-1">Env Vars <span class="text-slate-600">(KEY=VALUE, one per line)</span></label>
+            <textarea name="env_vars" rows="2" class="w-full bg-slate-700 border border-slate-600 text-slate-100 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500 font-mono" placeholder="ANTHROPIC_BASE_URL=https://...&#10;DEBUG=1"></textarea>
+        </div>
+        <div>
+            <label class="block text-xs text-slate-400 mb-1">System Prompt</label>
+            <input name="prompt" class="w-full bg-slate-700 border border-slate-600 text-slate-100 rounded-lg px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-blue-500" placeholder="Optional system prompt...">
+        </div>
+        <div class="flex items-end">
+            <button type="submit" class="btn-primary text-sm w-full"><i class="fa-solid fa-plus mr-1"></i> Add Template</button>
+        </div>
+    </form>
+</div>
+
+<!-- Templates List -->
+<div class="card overflow-x-auto">
+    <table class="w-full text-sm">
+        <thead>
+            <tr class="text-left text-xs text-slate-400 uppercase tracking-wider border-b border-slate-700">
+                <th class="p-2">Name</th>
+                <th class="p-2 hidden sm:table-cell">Title</th>
+                <th class="p-2 hidden md:table-cell">CWD</th>
+                <th class="p-2 hidden lg:table-cell">Model</th>
+                <th class="p-2 hidden md:table-cell">Profile</th>
+                <th class="p-2 hidden xl:table-cell">Prompt</th>
+                <th class="p-2 hidden lg:table-cell">Command</th>
+                <th class="p-2 hidden lg:table-cell">Env Vars</th>
+                <th class="p-2 text-right">Actions</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for t in templates %}
+            <tr id="template-row-{{ t.id }}" class="border-b border-slate-700/50 hover:bg-slate-750 transition-colors">
+                <td class="p-2" data-field="name" data-value="{{ t.name|e }}">
+                    <span class="font-medium">{{ t.name }}</span>
+                </td>
+                <td class="p-2 hidden sm:table-cell text-slate-400" data-field="title" data-value="{{ t.title|e }}">
+                    {{ t.title or '—' }}
+                </td>
+                <td class="p-2 hidden md:table-cell text-slate-500 font-mono text-xs" data-field="cwd" data-value="{{ t.cwd|e }}">
+                    {{ t.cwd or '—' }}
+                </td>
+                <td class="p-2 hidden lg:table-cell text-slate-400" data-field="model" data-value="{{ t.model|e }}">
+                    {{ t.model or '—' }}
+                </td>
+                <td class="p-2 hidden md:table-cell text-slate-400" data-field="mode" data-value="{{ t.mode }}">
+                    {{ t.mode }}
+                </td>
+                <td class="p-2 hidden xl:table-cell text-slate-500 max-w-[200px] truncate" data-field="prompt" data-value="{{ t.prompt|e }}">
+                    {{ t.prompt[:50] or '—' }}
+                </td>
+                <td class="p-2 hidden lg:table-cell text-slate-400 font-mono text-xs" data-field="command" data-value="{{ t.command|e }}">{{ t.command or 'claude' }}</td>
+                <td class="p-2 hidden lg:table-cell text-slate-500 text-xs max-w-[120px] truncate" data-field="env_vars" data-value="{{ t.env_vars|e }}">{{ t.env_vars[:30] or '' }}</td>
+                <td class="p-2 text-right">
+                    <button onclick="editTemplate({{ t.id }})" class="text-blue-400 hover:text-blue-300 text-xs mr-2" title="Edit">
+                        <i class="fa-solid fa-pen-to-square"></i>
+                    </button>
+                    <button onclick="deleteTemplate({{ t.id }})" class="text-red-400 hover:text-red-300 text-xs" title="Delete">
+                        <i class="fa-solid fa-trash"></i>
+                    </button>
+                </td>
+            </tr>
+            {% else %}
+            <tr>
+                <td colspan="7" class="p-8 text-center text-slate-500">
+                    <i class="fa-solid fa-layer-group text-3xl block mb-2"></i>
+                    <p>No templates yet. Add one above to get started.</p>
+                </td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+{% endblock %}

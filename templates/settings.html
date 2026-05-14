@@ -1,0 +1,203 @@
+{% extends "base.html" %}
+{% block title %}Settings - Claude Code Web{% endblock %}
+{% block head_extra %}
+<script>
+    async function refreshAll() {
+        const btn = document.getElementById('refresh-btn');
+        const orig = btn.innerHTML;
+        btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin mr-1"></i> Refreshing...';
+        btn.disabled = true;
+        document.getElementById('mcp-list').innerHTML = '<p class="text-slate-400 text-sm p-2 col-span-full"><i class="fa-solid fa-spinner fa-spin mr-2"></i> Checking MCP servers...</p>';
+        try {
+            const r = await fetch('/api/settings/refresh');
+            const data = await r.json();
+            renderMCP(data.mcp_config);
+            renderPlugins(data.plugins);
+            renderSkills(data.skills);
+        } catch(e) {
+            document.getElementById('mcp-list').innerHTML = '<p class="text-red-400 text-sm p-2">Refresh failed: ' + e.message + '</p>';
+        } finally {
+            btn.innerHTML = orig;
+            btn.disabled = false;
+        }
+    }
+
+    function renderMCP(configList) {
+        const container = document.getElementById('mcp-list');
+        container.innerHTML = '';
+        configList.forEach(cfg => {
+            const item = document.createElement('div');
+            item.className = 'p-4 bg-slate-800/50 rounded-lg border border-slate-700';
+            item.innerHTML = `
+                <div class="flex items-center gap-2 mb-1">
+                    <i class="fa-solid fa-server text-blue-400 text-sm"></i>
+                    <p class="text-sm font-medium">${escapeHtml(cfg.name)}</p>
+                </div>
+                <p class="text-xs text-slate-400 leading-relaxed">${escapeHtml(cfg.description || '')}</p>
+                <p class="text-xs text-slate-500 mt-1 font-mono truncate">${escapeHtml(cfg.command || '')} ${cfg.args ? cfg.args.join(' ') : ''}</p>`;
+            container.appendChild(item);
+        });
+    }
+
+    function renderPlugins(plugins) {
+        const container = document.getElementById('plugins-list');
+        container.innerHTML = '';
+        if (!plugins.length) {
+            container.innerHTML = '<p class="text-slate-500 text-sm p-2">No plugins installed.</p>';
+            return;
+        }
+        plugins.forEach(p => {
+            const item = document.createElement('div');
+            item.className = 'p-4 bg-slate-800/50 rounded-lg border border-slate-700';
+            item.innerHTML = `
+                <div class="flex items-center gap-2 mb-1">
+                    <i class="fa-solid fa-puzzle-piece text-purple-400 text-sm"></i>
+                    <p class="text-sm font-medium">${escapeHtml(p.name)}</p>
+                    <span class="text-xs text-slate-500">v${p.version || '?'}</span>
+                </div>
+                <p class="text-xs text-slate-400 leading-relaxed">${escapeHtml(p.description || '')}</p>`;
+            container.appendChild(item);
+        });
+    }
+
+    function renderSkills(skills) {
+        const container = document.getElementById('skills-list');
+        container.innerHTML = '';
+        if (!skills.length) {
+            container.innerHTML = '<p class="text-slate-500 text-sm p-2">No skills configured.</p>';
+            return;
+        }
+        skills.forEach(s => {
+            const item = document.createElement('div');
+            item.className = 'p-4 bg-slate-800/50 rounded-lg border border-slate-700 hover:border-blue-500/50 hover:bg-slate-800 cursor-pointer transition-colors';
+            item.onclick = () => viewSkill(s.name);
+            item.innerHTML = `
+                <div class="flex items-center gap-2 mb-1">
+                    <i class="fa-solid fa-wand-magic-sparkles text-yellow-400 text-sm"></i>
+                    <p class="text-sm font-medium">${escapeHtml(s.name)}</p>
+                </div>
+                <p class="text-xs text-slate-400 leading-relaxed">${escapeHtml(s.description || s.source || '')}</p>`;
+            container.appendChild(item);
+        });
+    }
+
+    function escapeHtml(text) {
+        const div = document.createElement('div');
+        div.textContent = text || '';
+        return div.innerHTML;
+    }
+
+    async function viewSkill(name) {
+        const modal = document.getElementById('skill-modal');
+        const title = document.getElementById('skill-modal-title');
+        const body = document.getElementById('skill-modal-body');
+        title.textContent = name;
+        body.innerHTML = '<p class="text-slate-400 text-sm"><i class="fa-solid fa-spinner fa-spin mr-2"></i> Loading...</p>';
+        modal.classList.remove('hidden');
+        try {
+            const r = await fetch('/api/skills/' + encodeURIComponent(name));
+            if (!r.ok) throw new Error('Not found');
+            const data = await r.json();
+            body.innerHTML = marked.parse(data.content, { breaks: true, gfm: true });
+        } catch(e) {
+            body.innerHTML = '<p class="text-red-400 text-sm">Failed to load: ' + escapeHtml(e.message) + '</p>';
+        }
+    }
+
+    function closeSkillModal() {
+        document.getElementById('skill-modal').classList.add('hidden');
+    }
+
+    document.addEventListener('keydown', function(e) {
+        if (e.key === 'Escape') closeSkillModal();
+    });
+</script>
+{% endblock %}
+{% block content %}
+
+<div class="flex items-center justify-between mb-4">
+    <div class="flex items-center gap-2">
+        <button onclick="toggleSidebar()" class="w-7 h-7 rounded-lg bg-slate-800 border border-slate-700 hover:bg-slate-700 transition-colors flex items-center justify-center flex-shrink-0" title="Menu">
+            <i class="fa-solid fa-bars text-slate-300 text-xs"></i>
+        </button>
+        <h1 class="text-xl font-bold">Settings & Status <i class="fa-solid fa-gear ml-2 text-blue-400"></i></h1>
+    </div>
+    <button id="refresh-btn" onclick="refreshAll()" class="btn-primary text-sm">
+        <i class="fa-solid fa-rotate mr-1"></i> Refresh
+    </button>
+</div>
+
+<!-- MCP Servers -->
+<div class="mb-5">
+    <h2 class="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3">
+        <i class="fa-solid fa-server mr-1"></i> MCP Servers
+    </h2>
+    <div id="mcp-list" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+        {% for cfg in mcp_config %}
+        <div class="p-4 bg-slate-800/50 rounded-lg border border-slate-700">
+            <div class="flex items-center gap-2 mb-1">
+                <i class="fa-solid fa-server text-blue-400 text-sm"></i>
+                <p class="text-sm font-medium">{{ cfg.name }}</p>
+            </div>
+            <p class="text-xs text-slate-400 leading-relaxed">{{ cfg.description or '' }}</p>
+            <p class="text-xs text-slate-500 mt-1 font-mono truncate">{{ cfg.command or '' }} {{ ' '.join(cfg.args) if cfg.args else '' }}</p>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+
+<!-- Plugins -->
+<div class="mb-5">
+    <h2 class="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3">
+        <i class="fa-solid fa-puzzle-piece mr-1"></i> Plugins
+    </h2>
+    <div id="plugins-list" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+        {% for p in plugins %}
+        <div class="p-4 bg-slate-800/50 rounded-lg border border-slate-700">
+            <div class="flex items-center gap-2 mb-1">
+                <i class="fa-solid fa-puzzle-piece text-purple-400 text-sm"></i>
+                <p class="text-sm font-medium">{{ p.name }}</p>
+                <span class="text-xs text-slate-500">v{{ p.version or '?' }}</span>
+            </div>
+            <p class="text-xs text-slate-400 leading-relaxed">{{ p.description or '' }}</p>
+        </div>
+        {% else %}
+        <p class="text-slate-500 text-sm p-2">No plugins installed.</p>
+        {% endfor %}
+    </div>
+</div>
+
+<!-- Skills -->
+<div class="mb-5">
+    <h2 class="text-sm font-semibold text-slate-400 uppercase tracking-wider mb-3">
+        <i class="fa-solid fa-wand-magic-sparkles mr-1"></i> Skills
+    </h2>
+    <div id="skills-list" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+        {% for s in skills %}
+        <div class="p-4 bg-slate-800/50 rounded-lg border border-slate-700 hover:border-blue-500/50 hover:bg-slate-800 cursor-pointer transition-colors" onclick="viewSkill('{{ s.name }}')">
+            <div class="flex items-center gap-2 mb-1">
+                <i class="fa-solid fa-wand-magic-sparkles text-yellow-400 text-sm"></i>
+                <p class="text-sm font-medium">{{ s.name }}</p>
+            </div>
+            <p class="text-xs text-slate-400 leading-relaxed">{{ s.description or s.source or '' }}</p>
+        </div>
+        {% else %}
+        <p class="text-slate-500 text-sm p-2">No skills configured.</p>
+        {% endfor %}
+    </div>
+</div>
+
+<!-- Skill Viewer Modal -->
+<div id="skill-modal" class="hidden fixed inset-0 z-50 flex items-center justify-center p-4">
+    <div class="fixed inset-0 bg-black/70" onclick="closeSkillModal()"></div>
+    <div class="relative bg-slate-800 border border-slate-600 rounded-xl shadow-2xl w-full max-w-3xl max-h-[85vh] flex flex-col z-10">
+        <div class="flex items-center justify-between px-5 py-3 border-b border-slate-700 flex-shrink-0">
+            <h3 class="text-sm font-semibold text-slate-200"><i class="fa-solid fa-wand-magic-sparkles text-yellow-400 mr-2"></i><span id="skill-modal-title"></span></h3>
+            <button onclick="closeSkillModal()" class="text-slate-400 hover:text-slate-200 transition-colors p-1 rounded hover:bg-slate-700">
+                <i class="fa-solid fa-xmark text-lg"></i>
+            </button>
+        </div>
+        <div id="skill-modal-body" class="overflow-y-auto p-5 markdown-content text-sm"></div>
+    </div>
+</div>
+{% endblock %}
