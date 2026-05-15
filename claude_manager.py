@@ -30,6 +30,7 @@ class SessionEventBus:
         self._started_at = time.time()
         self._seq = 0
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._done_event: asyncio.Event | None = None
 
     def set_event_loop(self, loop: asyncio.AbstractEventLoop):
         self._loop = loop
@@ -37,6 +38,14 @@ class SessionEventBus:
     @property
     def running(self) -> bool:
         return self._running
+
+    @property
+    def last_seq(self) -> int:
+        return self._seq
+
+    @property
+    def history_length(self) -> int:
+        return len(self._history)
 
     @property
     def subscriber_count(self) -> int:
@@ -63,6 +72,29 @@ class SessionEventBus:
                 q.put_nowait(event)
             except asyncio.QueueFull:
                 pass
+
+    def snapshot_events(self, from_seq: int = 0) -> list[dict]:
+        return [e for e in self._history if e.get("seq", 0) >= from_seq]
+
+    def consolidate_history(self, fn):
+        fn(self._history)
+
+    def mark_started(self):
+        self._running = True
+        if self._done_event is None:
+            self._done_event = asyncio.Event()
+        self._done_event.clear()
+
+    def mark_done(self):
+        self._running = False
+        if self._done_event is not None:
+            self._done_event.set()
+
+    async def until_done(self):
+        if not self._running:
+            return
+        if self._done_event is not None:
+            await self._done_event.wait()
 
 
 # ─── ClaudeManager (utilities only) ───────────────────────────
@@ -482,55 +514,15 @@ class ClaudeManager:
             events.append({"type": "done", "summary": "Completed.", "has_denials": False})
         return events
 
-    def get_session_events_from_disk(self, db_session_id: int, cache_key: str = "") -> list[dict] | None:
-        self.sessions_dir.mkdir(parents=True, exist_ok=True)
-        path = self.sessions_dir / f"{db_session_id}_events.jsonl"
-        if not path.exists():
-            return None
-        try:
-            events = []
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    evt = json.loads(line)
-                    # Verify cache_key on first line
-                    if "__cache_key__" in evt:
-                        if cache_key and evt["__cache_key__"] != cache_key:
-                            return None  # stale cache — different session
-                        continue  # skip header
-                    events.append(evt)
-            return events
-        except Exception:
-            return None
-
     def delete_session_events_from_disk(self, db_session_id: int):
+        """One-shot cleanup of legacy events cache files from older versions.
+        Called from session-delete paths in main.py."""
         path = self.sessions_dir / f"{db_session_id}_events.jsonl"
         if path.exists():
             try:
                 path.unlink()
             except Exception:
                 pass
-
-    def write_bus_to_disk(self, db_session_id: int, events: list[dict], cache_key: str = ""):
-        self.sessions_dir.mkdir(parents=True, exist_ok=True)
-        path = self.sessions_dir / f"{db_session_id}_events.jsonl"
-        try:
-            # Load existing events and merge (dedup by seq)
-            existing = self.get_session_events_from_disk(db_session_id, cache_key) or []
-            seen_seq = {e.get("seq") for e in existing if e.get("seq")}
-            for evt in events:
-                if evt.get("seq") and evt["seq"] not in seen_seq:
-                    existing.append(evt)
-                    seen_seq.add(evt["seq"])
-            with open(path, "w", encoding="utf-8") as f:
-                if cache_key:
-                    f.write(json.dumps({"__cache_key__": cache_key}) + "\n")
-                for event in existing:
-                    f.write(json.dumps(event) + "\n")
-        except Exception:
-            pass
 
     @staticmethod
     def _read_json(path: Path) -> dict:
@@ -539,5 +531,6 @@ class ClaudeManager:
             if raw[:3] == b'\xef\xbb\xbf':
                 raw = raw[3:]
             return json.loads(raw.decode("utf-8"))
-        except Exception:
+        except Exception as e:
+            print(f"[ClaudeManager] _read_json({path}): {type(e).__name__}: {e}")
             return {}

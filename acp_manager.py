@@ -104,7 +104,8 @@ class AcpProcess:
                 if self._stopped: break
                 t = line.decode("utf-8", errors="replace").rstrip()
                 if t: print(f"[AcpProcess:stderr] {t}")
-        except Exception: pass
+        except Exception as e:
+            print(f"[AcpProcess:stderr] read error: {type(e).__name__}: {e}")
 
     async def request(self, method, params=None, timeout=300):
         if not self.running: raise RuntimeError("ACP not running")
@@ -127,7 +128,8 @@ class AcpProcess:
             try:
                 self._p.stdin.write((json.dumps(msg) + "\n").encode())
                 self._p.stdin.flush()
-            except Exception: pass
+            except Exception as e:
+                print(f"[AcpProcess] _send error: {type(e).__name__}: {e}")
 
     def stop(self):
         self._stopped = True
@@ -137,7 +139,8 @@ class AcpProcess:
                 self._p.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self._p.kill()
-            except Exception: pass
+            except Exception as e:
+                print(f"[AcpProcess] stop terminate error: {type(e).__name__}: {e}")
         for fut in self._pending.values():
             if not fut.done():
                 fut.get_loop().call_soon_threadsafe(fut.set_exception, RuntimeError("ACP stopped"))
@@ -153,6 +156,7 @@ class AcpSession:
         self.env_vars = env_vars
         self.idle_timeout = idle_timeout
         self._effort = effort
+        self._needs_history_preamble: bool = False
         self._proc: AcpProcess | None = None
         self._sid: str | None = None  # ACP session id
         self._claude_sid: str | None = None  # Claude resume id
@@ -186,8 +190,8 @@ class AcpSession:
         # Resolve symlinks so the cwd key matches what ACP stores in its jslog paths.
         try:
             cwd = os.path.realpath(cwd)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[AcpSession {self.db_id}] connect realpath({cwd}) error: {type(e).__name__}: {e}")
         prior_sid = self._claude_sid
         path_taken = "session/new (fresh)"
         load_error = None
@@ -217,10 +221,12 @@ class AcpSession:
         self._claude_sid = new_sid
         # Log the result so silent resume failures don't go unnoticed.
         if prior_sid and new_sid and prior_sid != new_sid:
+            self._needs_history_preamble = True
             print(f"[AcpSession {self.db_id}] connect: {path_taken} -> "
                   f"sessionId changed {prior_sid[:8]}... -> {new_sid[:8]}... "
-                  f"(context may not be carried)")
+                  f"(context may not be carried — DB preamble will be injected)")
         else:
+            self._needs_history_preamble = False
             sid_display = new_sid[:8] if new_sid else "?"
             print(f"[AcpSession {self.db_id}] connect: {path_taken} -> sessionId={sid_display}")
         await self.set_mode(self._mode)
@@ -232,30 +238,51 @@ class AcpSession:
         self._sid = None          # clear BEFORE await so send_prompt sees it's gone
         if self._proc and self._proc.running and sid:
             try: await self._proc.request("session/close", {"sessionId": sid}, timeout=5)
-            except Exception: pass
+            except Exception as e:
+                print(f"[AcpSession {self.db_id}] disconnect session/close error "
+                      f"(subprocess being torn down anyway): {type(e).__name__}: {e}")
         if self._proc: self._proc.stop(); self._proc = None
 
     async def send_prompt(self, text) -> SessionEventBus:
         if self._bus is None:
             self._bus = SessionEventBus()
         bus = self._bus
-        bus._running = True
-        bus._loop = self._loop
+        bus.set_event_loop(self._loop)
+        bus.mark_started()
         self._cancel_idle()
         bus._task = asyncio.create_task(self._run(bus, text))
         return bus
 
     async def _run(self, bus, text):
+        prompt_task = asyncio.create_task(self._proc.request(
+            "session/prompt",
+            {"sessionId": self._sid, "prompt": [{"type": "text", "text": text}]},
+            timeout=600,
+        ))
+        async def _watch_proc():
+            while True:
+                await asyncio.sleep(2)
+                if not (self._proc and self._proc.running):
+                    return RuntimeError("ACP subprocess exited mid-prompt")
+        watcher = asyncio.create_task(_watch_proc())
         try:
-            r = await self._proc.request("session/prompt",
-                {"sessionId": self._sid, "prompt": [{"type": "text", "text": text}]}, timeout=600)
+            done, _ = await asyncio.wait({prompt_task, watcher},
+                return_when=asyncio.FIRST_COMPLETED)
+            if watcher in done and prompt_task not in done:
+                err = watcher.result()
+                prompt_task.cancel()
+                raise err if isinstance(err, BaseException) else RuntimeError(str(err))
+            r = prompt_task.result()
             bus.publish({"type": "done", "summary": "Completed." if r.get("stopReason") == "end_turn"
                 else f"Stopped: {r.get('stopReason', '')}", "has_denials": False,
                 "data": {"stop_reason": r.get("stopReason"), "usage": r.get("usage", {})}})
         except Exception as e:
+            print(f"[AcpSession {self.db_id}] _run error: {type(e).__name__}: {e}")
             bus.publish({"type": "error", "text": str(e)})
         finally:
-            bus._running = False
+            if not watcher.done():
+                watcher.cancel()
+            bus.mark_done()
             self._reset_idle()
 
     async def interrupt(self):
@@ -266,16 +293,23 @@ class AcpSession:
         self._mode = m
         if self._proc and self._proc.running and self._sid:
             try: await self._proc.request("session/set_mode", {"sessionId": self._sid, "modeId": m}, timeout=10)
-            except Exception: pass
+            except Exception as e:
+                print(f"[AcpSession {self.db_id}] set_mode({m}) error: {type(e).__name__}: {e}")
 
     async def set_model(self, m):
         self._model = m
         if self._proc and self._proc.running and self._sid:
             try: await self._proc.request("session/set_model", {"sessionId": self._sid, "modelId": m}, timeout=10)
-            except Exception: pass
+            except Exception as e:
+                print(f"[AcpSession {self.db_id}] set_model({m}) error: {type(e).__name__}: {e}")
 
     def set_effort(self, eff):
         self._effort = eff
+
+    def consume_history_preamble(self) -> bool:
+        v = self._needs_history_preamble
+        self._needs_history_preamble = False
+        return v
 
     def get_modes(self): return list(self._modes)
 
@@ -302,7 +336,7 @@ class AcpSession:
     def _on_exit(self):
         if self._bus and self._bus.running:
             self._bus.publish({"type": "error", "text": "ACP process exited"})
-            self._bus._running = False
+            self._bus.mark_done()
 
     def _reset_idle(self):
         self._cancel_idle()
@@ -331,9 +365,10 @@ class AcpManager:
     def get_event_bus(self, db_id): return self._buses.get(db_id)
     def cleanup_event_bus(self, db_id):
         b = self._buses.pop(db_id, None)
-        if b: b._running = False
+        if b: b.mark_done()
 
-    async def send_prompt(self, db_id, prompt, working_dir="", env_vars="", claude_sid=None) -> SessionEventBus:
+    async def send_prompt(self, db_id, prompt, working_dir="", env_vars="",
+                          claude_sid=None, history_preamble_fn=None) -> SessionEventBus:
         s = self._sessions.get(db_id)
         effort = self._efforts.get(db_id, "max")
         if not s or not s.running or s.session_id is None:
@@ -344,8 +379,21 @@ class AcpManager:
             s.set_effort(effort)
         if not s.running:
             await s.connect(resume=bool(claude_sid))
+        # Inject DB history preamble if resume produced a new sessionId
+        injected = 0
+        if history_preamble_fn is not None and s.consume_history_preamble():
+            try:
+                preamble = await history_preamble_fn()
+                if preamble:
+                    prompt = preamble + "\n\n" + prompt
+                    injected = len(preamble)
+            except Exception as e:
+                print(f"[AcpManager] history_preamble_fn failed for sid={db_id}: "
+                      f"{type(e).__name__}: {e}")
         bus = await s.send_prompt(prompt)
         self._buses[db_id] = bus
+        if injected:
+            print(f"[AcpManager] injected DB preamble for sid={db_id} ({injected} chars)")
         return bus
 
     async def interrupt_session(self, db_id):
@@ -372,5 +420,9 @@ class AcpManager:
         self._efforts[db_id] = eff
         s = self._sessions.get(db_id)
         if s: s.set_effort(eff)
+
+    def consume_history_preamble_flag(self, db_id) -> bool:
+        s = self._sessions.get(db_id)
+        return s.consume_history_preamble() if s else False
 
     def get_session(self, db_id): return self._sessions.get(db_id)

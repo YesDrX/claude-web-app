@@ -539,6 +539,46 @@ def _build_full_prompt(prompt_text: str, claude_sid: str | None, system_prompt: 
     return prompt_text
 
 
+_PREAMBLE_MAX_CHARS = 16000
+_PREAMBLE_MAX_TURNS = 20
+
+
+async def _build_history_preamble(sid: int) -> str:
+    """Synthesize a prior-conversation preamble from DB messages for the model
+    when ACP resume produced a fresh sessionId (context not carried)."""
+    import database as db
+    database = await db.get_db()
+    try:
+        rows = await db.execute_fetchall(database,
+            "SELECT role, content, tool_name FROM messages "
+            "WHERE session_id = ? AND role IN ('user', 'assistant') "
+            "ORDER BY id DESC LIMIT ?",
+            (sid, _PREAMBLE_MAX_TURNS * 4))
+    finally:
+        await database.close()
+    rows.reverse()  # oldest first
+    lines = []
+    total = 0
+    for row in rows:
+        if row["tool_name"] == "_reasoning":
+            continue
+        line = f"{row['role']}: {row['content']}"
+        if total + len(line) > _PREAMBLE_MAX_CHARS:
+            break
+        lines.append(line)
+        total += len(line)
+    if not lines:
+        return ""
+    return (
+        "<prior-conversation>\n"
+        "The following is a reconstructed history from the local database because\n"
+        "the ACP backend did not carry forward the prior session context on resume.\n"
+        "Use this to understand what has already been discussed and decided.\n\n"
+        + "\n".join(lines) +
+        "\n</prior-conversation>"
+    )
+
+
 # ─── Streaming: forward bus events to WebSocket ──────────────────
 
 async def _stream_bus_to_ws(ws: WebSocket, sid: int, bus, my_queue: asyncio.Queue,
@@ -697,19 +737,16 @@ async def _save_consolidated_prompt_to_db(sid: int, events: list[dict]):
         await database.close()
 
 
-async def _persist_prompt_on_done(sid: int, bus, prompt_start_seq: int, cache_key: str):
-    """Wait for bus to finish, then persist events to DB and disk.
+async def _persist_prompt_on_done(sid: int, bus, prompt_start_seq: int):
+    """Wait for bus to finish, then persist events to DB.
 
     Runs as a background task spawned right after send_prompt. Independent of
     any WebSocket connection - if the WS disconnects mid-prompt, this task
     keeps polling the bus and persists when the prompt completes."""
     try:
-        while bus.running:
-            await asyncio.sleep(0.5)
-        if bus._history:
-            _consolidate_bus_history(bus._history, prompt_start_seq)
-        claude_manager.write_bus_to_disk(sid, bus._history, cache_key)
-        cur_events = [e for e in bus._history if e.get("seq", 0) >= prompt_start_seq]
+        await bus.until_done()
+        bus.consolidate_history(lambda hist: _consolidate_bus_history(hist, prompt_start_seq))
+        cur_events = bus.snapshot_events(from_seq=prompt_start_seq)
         if cur_events:
             await _save_consolidated_prompt_to_db(sid, cur_events)
         acp_s = acp_manager.get_session(sid)
@@ -815,7 +852,7 @@ async def websocket_chat(ws: WebSocket, sid: int):
 
         # ══════ PHASE 2: LIVE STREAM (if ACP is processing) ══════
         if bus and bus.running:
-            print(f"[WS:{sid}] Joining live bus ({len(bus._history)} buffered)")
+            print(f"[WS:{sid}] Joining live bus ({bus.history_length} buffered)")
             _history, my_queue = bus.subscribe(from_seq=last_replayed_seq + 1)
             stream_task = asyncio.create_task(
                 _stream_bus_to_ws(ws, sid, bus, my_queue, history=_history)
@@ -870,15 +907,16 @@ async def websocket_chat(ws: WebSocket, sid: int):
                     working_dir=session.get("cwd", ""),
                     env_vars=session.get("env_vars") or "",
                     claude_sid=session.get("claude_session_id"),
+                    history_preamble_fn=lambda: _build_history_preamble(sid),
                 )
-                prompt_start_seq = bus._seq + 1
+                prompt_start_seq = bus.last_seq + 1
                 bus.publish({"type": USER_MSG, "text": prompt_text})
                 await _ws_send(ws, sid, {"type": STATUS, "text": "Thinking..."})
 
                 # Spawn persistence task that survives WS disconnect.
-                asyncio.create_task(_persist_prompt_on_done(sid, bus, prompt_start_seq, cache_key))
+                asyncio.create_task(_persist_prompt_on_done(sid, bus, prompt_start_seq))
 
-                _history, my_queue = bus.subscribe(from_seq=bus._seq)
+                _history, my_queue = bus.subscribe(from_seq=bus.last_seq)
                 stream_task = asyncio.create_task(
                     _stream_bus_to_ws(ws, sid, bus, my_queue, history=_history)
                 )

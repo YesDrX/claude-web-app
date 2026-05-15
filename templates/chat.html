@@ -482,12 +482,22 @@ function ensureAssistantDiv() {
     const container = document.getElementById('messages-container');
     currentAssistantDiv = document.createElement('div');
     currentAssistantDiv.className = 'mb-4 pb-4 border-b border-slate-700/30';
-    currentAssistantDiv.innerHTML = `<div class="flex items-center gap-2 mb-1"><div class="w-5 h-5 rounded-full bg-blue-700 flex items-center justify-center flex-shrink-0"><i class="fa-solid fa-robot text-[10px]"></i></div><p class="text-xs text-slate-400">Claude</p></div><div class="reasoning-box hidden mb-2 border border-indigo-800/40 rounded overflow-hidden bg-[#1e1b4b]/30"><div class="reasoning-toggle flex items-center gap-1 px-2 py-1 cursor-pointer hover:bg-indigo-900/20 transition-colors border-b border-indigo-800/20 text-[0.65rem] text-purple-300" onclick="toggleInlineReasoning(this)"><span class="reasoning-chevron text-[0.55rem]">▶</span><span>Reasoning</span></div><div class="reasoning-content hidden px-2 py-1.5 text-[0.65rem] text-purple-200/80 font-mono whitespace-pre-wrap max-h-96 overflow-y-auto"></div></div><div class="text-sm markdown-content assistant-content"></div><div class="tool-calls-container hidden mt-2 border-l-2 border-purple-700/50 rounded-r-lg max-h-96 overflow-y-auto bg-slate-900/30"></div>`;
+    currentAssistantDiv.innerHTML = `<div class="flex items-center gap-2 mb-1"><div class="w-5 h-5 rounded-full bg-blue-700 flex items-center justify-center flex-shrink-0"><i class="fa-solid fa-robot text-[10px]"></i></div><p class="text-xs text-slate-400">Claude</p></div><div class="reasoning-slot"></div><div class="text-sm markdown-content assistant-content"></div><div class="tool-calls-container hidden mt-2 border-l-2 border-purple-700/50 rounded-r-lg max-h-96 overflow-y-auto bg-slate-900/30"></div>`;
     container.appendChild(currentAssistantDiv);
-    const rb = currentAssistantDiv.querySelector('.reasoning-box');
+    currentReasoningContent = null;
+    currentReasoningToggle = null;
+    thinkingExpanded = false;
+}
+
+function _ensureReasoningBox() {
+    if (currentReasoningContent) return;
+    ensureAssistantDiv();
+    const slot = currentAssistantDiv.querySelector('.reasoning-slot');
+    if (!slot) return;
+    slot.innerHTML = `<div class="reasoning-box mb-2 border border-indigo-800/40 rounded overflow-hidden bg-[#1e1b4b]/30"><div class="reasoning-toggle flex items-center gap-1 px-2 py-1 cursor-pointer hover:bg-indigo-900/20 transition-colors border-b border-indigo-800/20 text-[0.65rem] text-purple-300" onclick="toggleInlineReasoning(this)"><span class="reasoning-chevron text-[0.55rem]">▶</span><span>Reasoning</span></div><div class="reasoning-content hidden px-2 py-1.5 text-[0.65rem] text-purple-200/80 font-mono whitespace-pre-wrap max-h-96 overflow-y-auto"></div></div>`;
+    const rb = slot.querySelector('.reasoning-box');
     currentReasoningContent = rb ? rb.querySelector('.reasoning-content') : null;
     currentReasoningToggle = rb ? rb.querySelector('.reasoning-toggle') : null;
-    thinkingExpanded = false;
 }
 function toggleInlineReasoning(toggleEl) {
     const box = toggleEl.parentElement; const content = box.querySelector('.reasoning-content');
@@ -497,13 +507,15 @@ function toggleInlineReasoning(toggleEl) {
     else { content.classList.add('hidden'); if (chevron) chevron.textContent = '▶'; }
 }
 function appendReasoningText(text) {
-    ensureAssistantDiv(); thinkingText += text;
+    if (!text) return;
+    ensureAssistantDiv(); _ensureReasoningBox();
+    thinkingText += text;
     if (currentReasoningContent && currentReasoningContent.parentElement) currentReasoningContent.parentElement.classList.remove('hidden');
-    if (!thinkingExpanded && text && currentReasoningToggle) { thinkingExpanded = true; const chevron = currentReasoningToggle.querySelector('.reasoning-chevron'); if (chevron) chevron.textContent = '▼'; }
+    if (!thinkingExpanded && currentReasoningToggle) { thinkingExpanded = true; const chevron = currentReasoningToggle.querySelector('.reasoning-chevron'); if (chevron) chevron.textContent = '▼'; }
     if (currentReasoningContent) { currentReasoningContent.textContent = thinkingText; currentReasoningContent.classList.remove('hidden'); currentReasoningContent.scrollTop = currentReasoningContent.scrollHeight; }
 }
 function finalizeCurrentReasoning() {
-    if (currentReasoningContent && thinkingText) { const box = currentReasoningContent.closest('.reasoning-box'); if (box) box.classList.remove('hidden'); if (currentReasoningToggle) { const chevron = currentReasoningToggle.querySelector('.reasoning-chevron'); if (chevron) chevron.textContent = '▶'; } currentReasoningContent.classList.add('hidden'); }
+    if (currentReasoningContent && thinkingText) { if (currentReasoningToggle) { const chevron = currentReasoningToggle.querySelector('.reasoning-chevron'); if (chevron) chevron.textContent = '▶'; } currentReasoningContent.classList.add('hidden'); }
     thinkingExpanded = false; currentReasoningContent = null; currentReasoningToggle = null;
 }
 
