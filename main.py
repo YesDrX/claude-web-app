@@ -835,8 +835,8 @@ async def websocket_chat(ws: WebSocket, sid: int):
         # Only replay from a running bus (in-flight prompt not yet in DB).
         # The Jinja-rendered page already has the full DB history in the DOM.
         last_replayed_seq = max(from_seq - 1, 0)
-        if bus and bus.running and bus._history:
-            replay_events = [e for e in bus._history if e.get("seq", 0) >= from_seq]
+        if bus and bus.running and bus.history_length:
+            replay_events = bus.snapshot_events(from_seq=from_seq)
             if replay_events:
                 await _ws_send(ws, sid, {"type": REPLAY_START, "count": len(replay_events), "live": True, "seq": 0})
                 for evt in replay_events:
