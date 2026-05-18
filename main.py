@@ -835,7 +835,14 @@ async def websocket_chat(ws: WebSocket, sid: int):
         # Use bus.running (not history_length) — a just-started turn is still live.
         last_replayed_seq = max(from_seq - 1, 0)
         live = bool(bus and bus.running)
-        replay_events = bus.snapshot_events(from_seq=from_seq) if live else []
+        if live:
+            # Clamp to current turn start so prior turns' events (esp. their
+            # 'done', which re-enables input) don't leak in when a refresh
+            # during turn N comes in with a stale lastProcessedSeq.
+            effective_from = max(from_seq, bus.current_turn_start_seq)
+            replay_events = bus.snapshot_events(from_seq=effective_from)
+        else:
+            replay_events = []
         await _ws_send(ws, sid, {"type": REPLAY_START,
                                   "count": len(replay_events),
                                   "live": live, "seq": 0})
@@ -911,6 +918,7 @@ async def websocket_chat(ws: WebSocket, sid: int):
                     mode=session.get("mode") or "bypassPermissions",
                 )
                 prompt_start_seq = bus.last_seq + 1
+                bus.mark_turn_start(prompt_start_seq)
                 bus.publish({"type": USER_MSG, "text": prompt_text})
                 await _ws_send(ws, sid, {"type": STATUS, "text": "Thinking..."})
 

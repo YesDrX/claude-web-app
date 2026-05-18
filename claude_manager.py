@@ -31,6 +31,10 @@ class SessionEventBus:
         self._seq = 0
         self._loop: asyncio.AbstractEventLoop | None = None
         self._done_event: asyncio.Event | None = None
+        # Seq of the current/most-recent turn's first event (the user_msg).
+        # Used by the WS replay path to avoid re-emitting prior turns' events
+        # (especially the prior turn's 'done', which would re-enable input).
+        self._current_turn_start_seq: int = 0
 
     def set_event_loop(self, loop: asyncio.AbstractEventLoop):
         self._loop = loop
@@ -46,6 +50,13 @@ class SessionEventBus:
     @property
     def history_length(self) -> int:
         return len(self._history)
+
+    @property
+    def current_turn_start_seq(self) -> int:
+        return self._current_turn_start_seq
+
+    def mark_turn_start(self, seq: int):
+        self._current_turn_start_seq = max(seq, 1)
 
     @property
     def subscriber_count(self) -> int:
