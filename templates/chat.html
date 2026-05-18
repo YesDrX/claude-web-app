@@ -187,7 +187,17 @@ function handleEvent(evt) {
             if (qContainer) {
                 const qItem = document.createElement('div');
                 qItem.className = 'flex items-start gap-2 p-2 rounded bg-blue-900/20';
-                qItem.innerHTML = `<i class="fa-solid fa-question-circle text-blue-400 mt-0.5 text-xs"></i><div class="text-xs markdown-content text-slate-200">${renderMarkdown(evt.question || evt.input?.question || 'Claude needs your input')}</div>`;
+                let qHtml = `<i class="fa-solid fa-question-circle text-blue-400 mt-0.5 text-xs"></i><div class="text-xs markdown-content text-slate-200">${renderMarkdown(evt.question || evt.input?.question || 'Claude needs your input')}</div>`;
+                // Render options list if present
+                const qOptions = evt.options || (evt.input && evt.input.options) || [];
+                if (qOptions.length > 0) {
+                    qHtml += '<div class="mt-1.5 space-y-0.5">' + qOptions.map(function(o) {
+                        const label = typeof o === 'string' ? o : (o.label || o.optionId || '?');
+                        return '<div class="text-[10px] text-blue-300/70">' + escapeHtml(String(label)) + '</div>';
+                    }).join('') + '</div>';
+                }
+                qHtml += '<div class="text-[10px] text-slate-500 mt-1">Reply via the prompt box below.</div>';
+                qItem.innerHTML = qHtml;
                 qContainer.appendChild(qItem); qContainer.classList.remove('hidden');
             }
             container.scrollTop = container.scrollHeight;
@@ -292,11 +302,7 @@ function showPermissionDialog(evt) {
             <div id="perm-title" class="text-xs text-slate-300 mb-1"></div>
             <div id="perm-kind" class="text-[10px] text-slate-500 mb-2"></div>
             <div id="perm-input" class="bg-slate-900 rounded p-2 text-[10px] text-slate-400 font-mono max-h-32 overflow-y-auto mb-3 hidden"><pre class="whitespace-pre-wrap"></pre></div>
-            <div class="flex gap-2 justify-end">
-                <button onclick="resolvePermission('reject_once')" class="btn-danger text-xs px-3 py-1.5">Deny</button>
-                <button onclick="resolvePermission('allow_once')" class="btn-primary text-xs px-3 py-1.5">Allow Once</button>
-                <button onclick="resolvePermission('allow_always')" class="btn-send text-xs px-3 py-1.5">Allow Always</button>
-            </div></div>`;
+            <div id="perm-buttons" class="flex gap-2 justify-end flex-wrap"></div></div>`;
         document.body.appendChild(dialog);
     }
     document.getElementById('perm-title').textContent = evt.title || 'Unknown tool';
@@ -307,6 +313,29 @@ function showPermissionDialog(evt) {
         inputDiv.querySelector('pre').textContent = JSON.stringify(evt.rawInput, null, 2);
     } else {
         inputDiv.classList.add('hidden');
+    }
+    // Render buttons from agent's actual options list
+    const btnContainer = document.getElementById('perm-buttons');
+    btnContainer.innerHTML = '';
+    const options = evt.options || [];
+    if (options.length > 0) {
+        options.forEach(function(opt) {
+            const val = opt.kind || opt.optionId || '';
+            if (!val) return;
+            const label = opt.label || val.replace(/_/g, ' ');
+            const cls = val === 'reject_once' ? 'btn-danger' : val === 'allow_always' ? 'btn-send' : 'btn-primary';
+            const btn = document.createElement('button');
+            btn.className = cls + ' text-xs px-3 py-1.5';
+            btn.textContent = label;
+            btn.onclick = function() { resolvePermission(val); };
+            btnContainer.appendChild(btn);
+        });
+    } else {
+        // Fallback hardcoded trio
+        btnContainer.innerHTML = `
+            <button onclick="resolvePermission('reject_once')" class="btn-danger text-xs px-3 py-1.5">Deny</button>
+            <button onclick="resolvePermission('allow_once')" class="btn-primary text-xs px-3 py-1.5">Allow Once</button>
+            <button onclick="resolvePermission('allow_always')" class="btn-send text-xs px-3 py-1.5">Allow Always</button>`;
     }
     dialog.classList.remove('hidden');
     dialog._requestId = evt.requestId;

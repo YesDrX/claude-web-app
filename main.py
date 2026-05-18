@@ -775,8 +775,6 @@ async def _handle_control(ws, sid, data, bus):
         return True
     elif t == CONFIRM_PERMISSION:
         await acp_manager.confirm_permission(sid, data.get("requestId", ""), data.get("optionId", "reject_once"))
-    elif t == "answer_question":
-        await acp_manager.confirm_permission(sid, data.get("requestId", ""), data.get("optionId", "reject_once"))
     elif t == SET_MODE:
         await acp_manager.set_mode(sid, data.get("mode", "bypassPermissions"))
         await _update_session_mode(sid, data.get("mode", "bypassPermissions"))
@@ -834,21 +832,23 @@ async def websocket_chat(ws: WebSocket, sid: int):
         # ══════ PHASE 1: REPLAY ══════
         # Only replay from a running bus (in-flight prompt not yet in DB).
         # The Jinja-rendered page already has the full DB history in the DOM.
+        # Use bus.running (not history_length) — a just-started turn is still live.
         last_replayed_seq = max(from_seq - 1, 0)
-        if bus and bus.running and bus.history_length:
-            replay_events = bus.snapshot_events(from_seq=from_seq)
-            if replay_events:
-                await _ws_send(ws, sid, {"type": REPLAY_START, "count": len(replay_events), "live": True, "seq": 0})
-                for evt in replay_events:
-                    await _ws_send(ws, sid, evt)
-                last_replayed_seq = max(e.get("seq", 0) for e in replay_events)
-            else:
-                await _ws_send(ws, sid, {"type": REPLAY_START, "count": 0, "live": False, "seq": 0})
-        else:
-            await _ws_send(ws, sid, {"type": REPLAY_START, "count": 0, "live": False, "seq": 0})
+        live = bool(bus and bus.running)
+        replay_events = bus.snapshot_events(from_seq=from_seq) if live else []
+        await _ws_send(ws, sid, {"type": REPLAY_START,
+                                  "count": len(replay_events),
+                                  "live": live, "seq": 0})
+        for evt in replay_events:
+            await _ws_send(ws, sid, evt)
+        if replay_events:
+            last_replayed_seq = max(e.get("seq", 0) for e in replay_events)
 
-        # End replay with done marker so client enables input
-        await _ws_send(ws, sid, {"type": DONE, "seq": 0})
+        # Only DONE when the turn is actually idle — the chat-page DONE handler
+        # re-enables input and tears down streaming state, which is wrong if a
+        # live phase is about to start.
+        if not live:
+            await _ws_send(ws, sid, {"type": DONE, "seq": 0})
 
         # ══════ PHASE 2: LIVE STREAM (if ACP is processing) ══════
         if bus and bus.running:
@@ -908,6 +908,7 @@ async def websocket_chat(ws: WebSocket, sid: int):
                     env_vars=session.get("env_vars") or "",
                     claude_sid=session.get("claude_session_id"),
                     history_preamble_fn=lambda: _build_history_preamble(sid),
+                    mode=session.get("mode") or "bypassPermissions",
                 )
                 prompt_start_seq = bus.last_seq + 1
                 bus.publish({"type": USER_MSG, "text": prompt_text})

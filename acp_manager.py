@@ -83,7 +83,13 @@ class AcpProcess:
                     msg = json.loads(line.decode("utf-8", errors="replace").strip())
                 except json.JSONDecodeError:
                     continue
-                if "id" in msg and isinstance(msg["id"], int):
+                # Check "method" first: incoming requests from the agent carry
+                # BOTH "id" AND "method" and must dispatch to _on_msg, not be
+                # mistaken for response messages.
+                if "method" in msg:
+                    if self._on_msg:
+                        self._on_msg(msg)
+                elif "id" in msg and isinstance(msg["id"], int):
                     fut = self._pending.pop(msg["id"], None)
                     if fut and not fut.done():
                         if "result" in msg:
@@ -91,8 +97,6 @@ class AcpProcess:
                         elif "error" in msg:
                             fut.get_loop().call_soon_threadsafe(fut.set_exception,
                                 RuntimeError(msg["error"].get("message", "ACP error")))
-                elif "method" in msg and self._on_msg:
-                    self._on_msg(msg)
         except Exception as e:
             print(f"[AcpProcess] read error: {e}")
         finally:
@@ -123,6 +127,14 @@ class AcpProcess:
         if params: msg["params"] = params
         self._send(msg)
 
+    def respond(self, rid, result=None, error=None):
+        msg = {"jsonrpc": "2.0", "id": rid}
+        if error is not None:
+            msg["error"] = error
+        else:
+            msg["result"] = result if result is not None else {}
+        self._send(msg)
+
     def _send(self, msg):
         if self._p and self._p.stdin:
             try:
@@ -150,7 +162,8 @@ class AcpProcess:
 # ─── AcpSession ──────────────────────────────────────────────
 
 class AcpSession:
-    def __init__(self, db_id, working_dir="", env_vars="", idle_timeout=1800, effort="max"):
+    def __init__(self, db_id, working_dir="", env_vars="", idle_timeout=1800, effort="max",
+                 mode="bypassPermissions"):
         self.db_id = db_id
         self.working_dir = working_dir
         self.env_vars = env_vars
@@ -161,10 +174,11 @@ class AcpSession:
         self._sid: str | None = None  # ACP session id
         self._claude_sid: str | None = None  # Claude resume id
         self._bus: SessionEventBus | None = None
-        self._mode = "bypassPermissions"
+        self._mode = mode or "bypassPermissions"
         self._model = ""
         self._idle_task: asyncio.Task | None = None
         self._modes = list(ACP_MODES)
+        self._pending_perms: dict[str, tuple[int, list]] = {}  # client_req_id -> (rpc_id, options)
         self._on_event: callable | None = None  # called for each event (DB persistence)
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -234,6 +248,7 @@ class AcpSession:
 
     async def disconnect(self):
         self._cancel_idle()
+        self._cancel_pending_permissions()
         sid = self._sid
         self._sid = None          # clear BEFORE await so send_prompt sees it's gone
         if self._proc and self._proc.running and sid:
@@ -286,6 +301,7 @@ class AcpSession:
             self._reset_idle()
 
     async def interrupt(self):
+        self._cancel_pending_permissions()
         if self._proc and self._proc.running and self._sid:
             self._proc.notify("session/cancel", {"sessionId": self._sid})
 
@@ -313,25 +329,156 @@ class AcpSession:
 
     def get_modes(self): return list(self._modes)
 
-    # ─── Notification → bus ──────────────────────────────────
+    # ─── Notification / request dispatch ──────────────────────
 
     def _on_notification(self, msg):
         method = msg.get("method", "")
-        if method != "session/update": return
-        update = msg.get("params", {}).get("update", {})
-        su = update.get("sessionUpdate", "")
-        if su == "system_init":
-            sid = update.get("session_id") or update.get("sessionId") or ""
-            if sid: self._claude_sid = sid
-            if self._bus: self._bus.publish({"type": "system_init", "session_id": sid})
+        rpc_id = msg.get("id")
+        params = msg.get("params", {}) or {}
+
+        if method == "session/update":
+            update = params.get("update", {})
+            su = update.get("sessionUpdate", "")
+            if su == "system_init":
+                sid = update.get("session_id") or update.get("sessionId") or ""
+                if sid: self._claude_sid = sid
+                if self._bus: self._bus.publish({"type": "system_init", "session_id": sid})
+                return
+            if su == "config_option_update":
+                for opt in update.get("configOptions", []):
+                    if opt.get("category") == "mode":
+                        self._modes = [m.get("value", m) if isinstance(m, dict) else m for m in opt.get("options", [])]
+                return
+            for evt in _acp_to_event(update):
+                if self._bus: self._bus.publish(evt)
             return
-        if su == "config_option_update":
-            for opt in update.get("configOptions", []):
-                if opt.get("category") == "mode":
-                    self._modes = [m.get("value", m) if isinstance(m, dict) else m for m in opt.get("options", [])]
+
+        if method == "session/request_permission" and rpc_id is not None:
+            tool_call = params.get("toolCall", {}) or {}
+            options = params.get("options", []) or []
+            client_req_id = f"perm-{rpc_id}"
+            self._pending_perms[client_req_id] = (rpc_id, options)
+            if self._bus:
+                self._bus.publish({
+                    "type": "permission_request",
+                    "requestId": client_req_id,
+                    "title": tool_call.get("title", "Tool"),
+                    "kind": tool_call.get("kind", "execute"),
+                    "rawInput": tool_call.get("rawInput", {}),
+                    "options": options,
+                })
             return
-        for evt in _acp_to_event(update):
-            if self._bus: self._bus.publish(evt)
+
+        if method == "fs/read_text_file":
+            self._handle_fs_read(rpc_id, params)
+            return
+
+        if method == "fs/write_text_file":
+            self._handle_fs_write(rpc_id, params)
+            return
+
+        # Unknown request: never let the agent hang on us.
+        if rpc_id is not None and self._proc:
+            self._proc.respond(
+                rpc_id,
+                error={"code": -32601,
+                       "message": f"Method not handled: {method}"})
+
+    # ─── Permission response ───────────────────────────────────
+
+    async def confirm_permission(self, request_id: str, option_id: str):
+        entry = self._pending_perms.pop(request_id, None)
+        if not entry or not self._proc:
+            return
+        rpc_id, options = entry
+        if option_id == "cancel":
+            outcome = {"outcome": "cancelled"}
+        else:
+            real = None
+            for opt in options:
+                if opt.get("kind") == option_id or opt.get("optionId") == option_id:
+                    real = opt.get("optionId"); break
+            if real is None and options:
+                real = options[0].get("optionId")
+            outcome = {"outcome": "selected", "optionId": real} if real is not None else {"outcome": "cancelled"}
+        self._proc.respond(rpc_id, {"outcome": outcome})
+
+    def _cancel_pending_permissions(self):
+        if not self._proc:
+            self._pending_perms.clear()
+            return
+        for client_req_id, (rpc_id, opts) in list(self._pending_perms.items()):
+            try:
+                self._proc.respond(rpc_id, {"outcome": {"outcome": "cancelled"}})
+            except Exception as e:
+                print(f"[AcpSession {self.db_id}] cancel perm error: {type(e).__name__}: {e}")
+        self._pending_perms.clear()
+
+    # ─── FS handlers (sync — runs in _read thread) ─────────────
+
+    def _handle_fs_read(self, msg_id, params):
+        if not self._proc:
+            return
+        try:
+            path = params.get("path", "")
+            if not path or not os.path.isabs(path):
+                self._proc.respond(msg_id, error={"code": -32000, "message": f"Invalid path: {path}"})
+                return
+            if "\x00" in path:
+                self._proc.respond(msg_id, error={"code": -32000, "message": "NULL bytes in path"})
+                return
+            p = Path(path)
+            if not p.exists():
+                self._proc.respond(msg_id, error={"code": -32000, "message": f"File not found: {path}"})
+                return
+            if not p.is_file():
+                self._proc.respond(msg_id, error={"code": -32000, "message": f"Not a file: {path}"})
+                return
+            size = p.stat().st_size
+            if size > 10 * 1024 * 1024:
+                self._proc.respond(msg_id, error={"code": -32000, "message": f"File too large ({size} bytes)"})
+                return
+            line_start = params.get("line")
+            line_limit = params.get("limit")
+            if line_start is not None or line_limit is not None:
+                text = p.read_text("utf-8")
+                lines = text.splitlines()
+                start = max(0, (line_start or 1) - 1)
+                end = len(lines) if line_limit is None else start + line_limit
+                content = "\n".join(lines[start:end])
+            else:
+                content = p.read_text("utf-8")
+            self._proc.respond(msg_id, {"content": content})
+        except PermissionError:
+            self._proc.respond(msg_id, error={"code": -32000, "message": f"Permission denied: {params.get('path', '')}"})
+        except Exception as e:
+            print(f"[AcpSession {self.db_id}] fs_read error: {type(e).__name__}: {e}")
+            self._proc.respond(msg_id, error={"code": -32000, "message": str(e)})
+
+    def _handle_fs_write(self, msg_id, params):
+        if not self._proc:
+            return
+        try:
+            path = params.get("path", "")
+            content = params.get("content", "")
+            if not path or not os.path.isabs(path):
+                self._proc.respond(msg_id, error={"code": -32000, "message": f"Invalid path: {path}"})
+                return
+            if "\x00" in path:
+                self._proc.respond(msg_id, error={"code": -32000, "message": "NULL bytes in path"})
+                return
+            if not isinstance(content, str):
+                self._proc.respond(msg_id, error={"code": -32000, "message": "content must be a string"})
+                return
+            p = Path(path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, "utf-8")
+            self._proc.respond(msg_id, {})
+        except PermissionError:
+            self._proc.respond(msg_id, error={"code": -32000, "message": f"Permission denied: {params.get('path', '')}"})
+        except Exception as e:
+            print(f"[AcpSession {self.db_id}] fs_write error: {type(e).__name__}: {e}")
+            self._proc.respond(msg_id, error={"code": -32000, "message": str(e)})
 
     def _on_exit(self):
         if self._bus and self._bus.running:
@@ -368,11 +515,11 @@ class AcpManager:
         if b: b.mark_done()
 
     async def send_prompt(self, db_id, prompt, working_dir="", env_vars="",
-                          claude_sid=None, history_preamble_fn=None) -> SessionEventBus:
+                          claude_sid=None, history_preamble_fn=None, mode="bypassPermissions") -> SessionEventBus:
         s = self._sessions.get(db_id)
         effort = self._efforts.get(db_id, "max")
         if not s or not s.running or s.session_id is None:
-            s = AcpSession(db_id, working_dir, env_vars, self.idle_timeout, effort=effort)
+            s = AcpSession(db_id, working_dir, env_vars, self.idle_timeout, effort=effort, mode=mode)
             if claude_sid: s.set_claude_session_id(claude_sid)
             self._sessions[db_id] = s
         else:
@@ -412,6 +559,10 @@ class AcpManager:
     async def set_model(self, db_id, model):
         s = self._sessions.get(db_id)
         if s: await s.set_model(model)
+
+    async def confirm_permission(self, db_id, request_id, option_id):
+        s = self._sessions.get(db_id)
+        if s: await s.confirm_permission(request_id, option_id)
 
     def get_effort(self, db_id) -> str:
         return self._efforts.get(db_id, "max")
