@@ -341,6 +341,10 @@ class AcpSession:
             su = update.get("sessionUpdate", "")
             if su == "system_init":
                 sid = update.get("session_id") or update.get("sessionId") or ""
+                if sid and self._claude_sid and sid != self._claude_sid:
+                    self._needs_history_preamble = True
+                    print(f"[AcpSession {self.db_id}] system_init: sessionId changed: {self._claude_sid} -> {sid} !")
+                    self._claude_sid = sid
                 if sid: self._claude_sid = sid
                 if self._bus: self._bus.publish({"type": "system_init", "session_id": sid})
                 return
